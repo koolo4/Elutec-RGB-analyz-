@@ -442,6 +442,65 @@ def open_camera_device(index, width=None, height=None, max_attempts=15):
 
 
 
+MIN_CAMERA_WIDTH = 640
+MIN_CAMERA_HEIGHT = 480
+
+
+def filter_supported_resolutions(modes, min_width=MIN_CAMERA_WIDTH, min_height=MIN_CAMERA_HEIGHT):
+    """Normalise camera modes: unique ``(width, height)`` pairs, sorted ascending.
+
+    Modes below the supported minimum (640x480) are dropped.  The result is
+    sorted by pixel count (then width) so the first item is the smallest
+    usable mode and the last item is the maximum the device reported.
+    """
+    cleaned = set()
+    for mode in modes or []:
+        try:
+            width, height = int(mode[0]), int(mode[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if width >= int(min_width) and height >= int(min_height):
+            cleaned.add((width, height))
+    return sorted(cleaned, key=lambda item: (item[0] * item[1], item[0], item[1]))
+
+
+def recommended_resolution(modes):
+    """Return the recommended (balanced) mode for *modes* or ``(None, None)``.
+
+    The recommended mode is the largest mode that still fits the balanced
+    1280x720 budget (good detail without choking USB bandwidth / preview
+    rendering).  If every mode is larger than that, the smallest available
+    mode is the safest recommendation; if every mode is smaller, the largest
+    available mode is recommended.
+    """
+    ordered = filter_supported_resolutions(modes)
+    if not ordered:
+        return None, None
+    balanced = [mode for mode in ordered if mode[0] <= 1280 and mode[1] <= 720]
+    if balanced:
+        return balanced[-1]
+    if ordered[0][0] > 1280 or ordered[0][1] > 720:
+        return ordered[0]
+    return ordered[-1]
+
+
+def choose_resolution(modes, choice="auto"):
+    """Resolve a saved resolution choice against the modes a device offers.
+
+    ``"auto"`` (and any choice the device no longer offers) resolves to the
+    recommended mode, so the recommended mode is always the fallback.
+    """
+    ordered = filter_supported_resolutions(modes)
+    if str(choice or "auto").strip().lower() != "auto":
+        try:
+            width, height = [int(part) for part in str(choice).lower().replace("×", "x").split("x")]
+            if (width, height) in ordered:
+                return width, height
+        except (TypeError, ValueError):
+            pass
+    return recommended_resolution(ordered)
+
+
 def probe_supported_camera_resolutions(index, max_attempts=3):
     """Probe common camera modes through real frame capture.
 
@@ -450,8 +509,9 @@ def probe_supported_camera_resolutions(index, max_attempts=3):
     The camera is opened and released for each candidate.
     """
     candidates = [
-        (640, 480), (800, 600), (1280, 720), (1280, 960),
-        (1920, 1080), (2560, 1440), (3840, 2160),
+        (640, 480), (800, 600), (1024, 768), (1280, 720), (1280, 960),
+        (1280, 1024), (1600, 1200), (1920, 1080), (1920, 1440),
+        (2560, 1440), (2592, 1944), (3840, 2160),
     ]
     supported = []
     for width, height in candidates:
@@ -472,7 +532,7 @@ def probe_supported_camera_resolutions(index, max_attempts=3):
                     cap.release()
                 except Exception:
                     pass
-    return supported
+    return filter_supported_resolutions(supported)
 
 
 def create_video_capture(source, width=None, height=None):

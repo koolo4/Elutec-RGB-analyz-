@@ -773,7 +773,7 @@ def run_analysis(config, parent=None, cap=None):
         live_win.btn_r.setChecked(bool(config.get('show_r', True)))
         live_win.btn_g.setChecked(bool(config.get('show_g', True)))
         live_win.btn_b.setChecked(bool(config.get('show_b', True)))
-        show_log = bool(config.get('show_log', True))
+        show_log = bool(config.get('show_log', False))
         live_win.log_btn.setChecked(show_log)
         for item in getattr(live_win, '_graph_items', []):
             if item.get('name') in ('Log10(B/R)', 'Log10(B/G)'):
@@ -922,7 +922,7 @@ def run_analysis(config, parent=None, cap=None):
                                         live_win.btn_r.setChecked(bool(config.get('show_r', True)))
                                         live_win.btn_g.setChecked(bool(config.get('show_g', True)))
                                         live_win.btn_b.setChecked(bool(config.get('show_b', True)))
-                                        show_l = bool(config.get('show_log', True))
+                                        show_l = bool(config.get('show_log', False))
                                         live_win.log_btn.setChecked(show_l)
                                         for itm in getattr(live_win, '_graph_items', []):
                                             if itm.get('name') in ('Log10(B/R)', 'Log10(B/G)'):

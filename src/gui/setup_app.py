@@ -16,10 +16,11 @@ from ..utils.math_utils import compute_log_br
 from ..utils.helpers import (
     compute_roi_means,
     detect_green_circle_roi,
-    scan_cameras, scan_ip_cameras, scan_miicam_cameras, create_video_capture, open_camera_device, warmup_capture,
+    scan_cameras, scan_miicam_cameras, create_video_capture, open_camera_device, warmup_capture,
     read_valid_frame, verify_capture_can_read, is_network_source, is_placeholder_frame, is_miicam_source,
     ivcam_setup_hint, get_default_save_folder, get_local_ip,
-    camera_label, camera_priority, is_ivcam_name, is_iriun_name, is_video_file_source, is_video_file_path, repair_video_file_if_needed, open_video_file_capture, probe_supported_camera_resolutions
+    camera_label, camera_priority, is_ivcam_name, is_iriun_name, is_video_file_source, is_video_file_path, repair_video_file_if_needed, open_video_file_capture, probe_supported_camera_resolutions,
+    filter_supported_resolutions, choose_resolution
 )
 from ..utils.ffmpeg_utils import ensure_pyqt5_platform_plugin_path
 from ..analysis.runner import run_analysis
@@ -136,7 +137,7 @@ class SetupApp:
             'save_folder': default_save,
             'video_folder': default_save,
             'show_r': True, 'show_g': True, 'show_b': True,
-            'show_log': True, 'show_slope': True, 'show_transition': True,
+            'show_log': False, 'show_slope': True, 'show_transition': True,
             'antialias': False,
             'performance_profile': DEFAULT_PERFORMANCE_PROFILE,
             **dict(PERFORMANCE_PROFILES[DEFAULT_PERFORMANCE_PROFILE]),
@@ -201,6 +202,12 @@ class SetupApp:
             pass
         for transient_key in ("session_id", "session_path", "exports_folder"):
             self.config.pop(transient_key, None)
+        # Product defaults re-applied on every launch: the Log10 plots stay
+        # hidden (their values are still computed and exported), and the
+        # camera always starts from the recommended resolution until the
+        # operator explicitly picks another mode for this session.
+        self.config['show_log'] = False
+        self.config['camera_resolution'] = 'auto'
 
         # Move mutable detector presets from the legacy config into the user's
         # separate preset library. A changed old Default becomes a named copy;
@@ -233,9 +240,11 @@ class SetupApp:
         self.devices_combined = []
         self.is_running = True
         self.camera_list = []
+        # The active video source lives here, not in a form field: the
+        # URL/index entry panel was removed from the interface.
+        self.source_var = tk.StringVar(value=str(self.config.get('source', '0')))
         self._camera_resolution_cache = {}
         self._resolution_combo_updating = False
-        self.ip_camera_list = []
         self.preview_scale = 1.0
         self.preview_width = 640
         self.preview_height = 480
@@ -255,11 +264,9 @@ class SetupApp:
         self.preview_last_rgb_update = 0.0
         self.preview_current_rgb = None
         self.preview_rgb_var = tk.StringVar(value="RGB ROI: —")
-        self.preview_log_var = tk.StringVar(value="Log10(B/R): —")
         self.preview_r_var = tk.StringVar(value="—")
         self.preview_g_var = tk.StringVar(value="—")
         self.preview_b_var = tk.StringVar(value="—")
-        self.preview_log_value_var = tk.StringVar(value="—")
         self.camera_status_var = tk.StringVar(value="Ожидание камеры")
         self._preview_has_frame = False
 
@@ -359,6 +366,10 @@ class SetupApp:
         style.configure('Small.TButton', background=surface_alt, foreground=muted, borderwidth=0,
                         padding=(5, 3), font=('Segoe UI', 8, 'bold'))
         style.map('Small.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
+                  foreground=[('active', accent)])
+        style.configure('Tiny.TButton', background=surface_alt, foreground=muted, borderwidth=0,
+                        padding=(2, 0), font=('Segoe UI', 7, 'bold'))
+        style.map('Tiny.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
                   foreground=[('active', accent)])
         style.configure('Danger.TButton', background=colors['danger_soft'], foreground=colors['danger'],
                         borderwidth=0, padding=(9, 7), font=('Segoe UI', 9, 'bold'))
@@ -545,7 +556,7 @@ class SetupApp:
         self.project_btn.pack(side='right', padx=(7, 0))
         self.lic_btn = ttk.Button(header, text='Лицензия', command=self.open_license_dialog, style='Quiet.TButton')
         self.lic_btn.pack(side='right', padx=(7, 0))
-        settings_btn = ttk.Button(header, text='Параметры', command=self.open_settings, style='Secondary.TButton')
+        settings_btn = ttk.Button(header, text='Настройки', command=self.open_settings, style='Secondary.TButton')
         settings_btn.pack(side='right', padx=(7, 0))
         self.theme_btn = ttk.Button(
             header, text='Светлая тема' if not self.config.get('light_theme', False) else 'Тёмная тема',
@@ -634,11 +645,9 @@ class SetupApp:
         scan_actions.columnconfigure(0, weight=1)
         scan_actions.columnconfigure(1, weight=1)
         ttk.Button(scan_actions, text='RGB-детектор', command=self.scan_rgb_detector,
-                   style='Small.TButton').grid(row=0, column=0, sticky='ew', padx=(0, 4), pady=(0, 4))
+                   style='Small.TButton').grid(row=0, column=0, sticky='ew', padx=(0, 4))
         ttk.Button(scan_actions, text='USB-камера', command=self.scan_usb_cameras,
-                   style='Small.TButton').grid(row=0, column=1, sticky='ew', padx=(4, 0), pady=(0, 4))
-        ttk.Button(scan_actions, text='Сеть / RTSP', command=self.scan_network_cameras,
-                   style='Small.TButton').grid(row=1, column=0, columnspan=2, sticky='ew')
+                   style='Small.TButton').grid(row=0, column=1, sticky='ew', padx=(4, 0))
 
         devices_box_frame = ttk.Frame(frame_scan, style='CardInset.TFrame', padding=3)
         devices_box_frame.pack(fill='both', expand=True, pady=(0, 7))
@@ -652,19 +661,7 @@ class SetupApp:
         self.devices_label = ttk.Label(frame_scan, text='Выбранное устройство: —',
                                        wraplength=265, style='CardMuted.TLabel')
         self.devices_label.pack(fill='x', pady=(0, 7))
-        ttk.Label(frame_scan, text='ИНДЕКС / URL / RTSP', style='Eyebrow.TLabel').pack(anchor='w', pady=(1, 4))
-        self.entry_source = ttk.Entry(frame_scan)
-        self.entry_source.insert(0, str(self.config.get('source', '0')))
-        self.entry_source.pack(fill='x', pady=(0, 6))
-        source_actions = ttk.Frame(frame_scan, style='Card.TFrame')
-        source_actions.pack(fill='x')
-        source_actions.columnconfigure(0, weight=1)
-        source_actions.columnconfigure(1, weight=1)
-        ttk.Button(source_actions, text='Применить', command=self.apply_source,
-                   style='Secondary.TButton').grid(row=0, column=0, sticky='ew', padx=(0, 3))
-        ttk.Button(source_actions, text='Переподключить', command=self.check_camera,
-                   style='Quiet.TButton').grid(row=0, column=1, sticky='ew', padx=(3, 0))
-        ttk.Label(frame_scan, text='РАЗРЕШЕНИЕ КАМЕРЫ', style='Eyebrow.TLabel').pack(anchor='w', pady=(8, 4))
+        ttk.Label(frame_scan, text='РАЗРЕШЕНИЕ КАМЕРЫ', style='Eyebrow.TLabel').pack(anchor='w', pady=(2, 4))
         self.resolution_var = tk.StringVar(value='Авто (рекомендуемое)')
         self.resolution_combo = ttk.Combobox(
             frame_scan, textvariable=self.resolution_var, state='readonly',
@@ -705,13 +702,16 @@ class SetupApp:
             ttk.Label(field, text=label_text, style='CardMuted.TLabel').pack(anchor='w', pady=(0, 3))
             controls = ttk.Frame(field, style='Card.TFrame')
             controls.pack(fill='x')
-            ttk.Button(controls, text='−', width=2, style='Small.TButton',
-                       command=lambda: self.adjust_value(var, -delta, min_val, max_val)).pack(side='left')
             entry = ttk.Entry(controls, width=6, justify='center', textvariable=var,
                               validate='key', validatecommand=(vcmd, '%P', str(min_val), str(max_val)))
-            entry.pack(side='left', fill='x', expand=True, padx=3)
-            ttk.Button(controls, text='+', width=2, style='Small.TButton',
-                       command=lambda: self.adjust_value(var, delta, min_val, max_val)).pack(side='left')
+            entry.pack(side='left', fill='x', expand=True, padx=(0, 3))
+            # Compact steppers: two tiny buttons stacked vertically on the right.
+            stepper = ttk.Frame(controls, style='Card.TFrame')
+            stepper.pack(side='right')
+            ttk.Button(stepper, text='+', width=1, style='Tiny.TButton',
+                       command=lambda: self.adjust_value(var, delta, min_val, max_val)).pack(side='top', fill='x')
+            ttk.Button(stepper, text='−', width=1, style='Tiny.TButton',
+                       command=lambda: self.adjust_value(var, -delta, min_val, max_val)).pack(side='top', fill='x', pady=(1, 0))
             var.trace_add('write', lambda *args: self.update_coord_label())
 
         create_spin_field(roi_grid, 0, 0, 'X · PX', self.var_x, 0, 1920)
@@ -751,7 +751,7 @@ class SetupApp:
         content.pack(fill='both', expand=True)
 
         frame_prev = ttk.Frame(content, style='Card.TFrame', padding=10)
-        frame_prev.pack(side='left', fill='both', expand=True)
+        frame_prev.pack(fill='both', expand=True)
         # Keep preview image requests from changing the parent layout size.
         frame_prev.pack_propagate(False)
         preview_header = ttk.Frame(frame_prev, style='Card.TFrame')
@@ -779,42 +779,23 @@ class SetupApp:
         legend.pack(side='right')
         for code, label_style in (('● R', 'R.TLabel'), ('● G', 'G.TLabel'), ('● B', 'B.TLabel')):
             ttk.Label(legend, text=code, style=label_style).pack(side='left', padx=(0, 8))
-        self.preview_rgb_canvas = tk.Canvas(frame_chart, height=165, highlightthickness=1)
-        self.preview_rgb_canvas.pack(fill='x')
-
-        # A narrow readout rail avoids a stack of redundant metric cards.
-        aside = ttk.Frame(content, width=256, style='Card.TFrame', padding=(13, 12))
-        aside.pack(side='right', fill='y', padx=(11, 0))
-        aside.pack_propagate(False)
-        ttk.Label(aside, text='ROI / READOUT', style='Eyebrow.TLabel').pack(anchor='w')
-        ttk.Label(aside, text='Показатели', style='CardTitle.TLabel').pack(anchor='w', pady=(3, 10))
-        metric_rows = (
+        # ROI colour readout lives with the signal history (the former right
+        # readout rail was removed): swatch + channel means in one compact row.
+        readout = ttk.Frame(frame_chart, style='Card.TFrame')
+        readout.pack(fill='x', pady=(0, 6))
+        self.preview_color_canvas = tk.Canvas(readout, width=48, height=26, highlightthickness=1)
+        self.preview_color_canvas.pack(side='left', padx=(0, 8))
+        ttk.Label(readout, text='Средний цвет ROI', style='CardMuted.TLabel').pack(side='left', padx=(0, 10))
+        for code, value_var, value_style in (
             ('R', self.preview_r_var, 'R.TLabel'),
             ('G', self.preview_g_var, 'G.TLabel'),
             ('B', self.preview_b_var, 'B.TLabel'),
-        )
-        for code, value_var, value_style in metric_rows:
-            row = ttk.Frame(aside, style='Card.TFrame', padding=(0, 8))
-            row.pack(fill='x')
-            ttk.Separator(row, orient='horizontal').pack(side='top', fill='x', pady=(0, 7))
-            ttk.Label(row, text=code, style=value_style, width=3).pack(side='left')
-            ttk.Label(row, textvariable=value_var, style='MetricValue.TLabel').pack(side='left')
-            ttk.Label(row, text='MEAN', style='Eyebrow.TLabel').pack(side='right', anchor='s', pady=(0, 3))
-        ttk.Separator(aside, orient='horizontal').pack(fill='x', pady=(6, 10))
-        ttk.Label(aside, text='LOG10 (B / R)', style='Eyebrow.TLabel').pack(anchor='w')
-        ttk.Label(aside, textvariable=self.preview_log_value_var,
-                  style='MetricValue.TLabel').pack(anchor='w', pady=(3, 10))
-        color_row = ttk.Frame(aside, style='Card.TFrame')
-        color_row.pack(fill='x', pady=(0, 11))
-        self.preview_color_canvas = tk.Canvas(color_row, width=48, height=28, highlightthickness=1)
-        self.preview_color_canvas.pack(side='left', padx=(0, 8))
-        ttk.Label(color_row, text='Средний цвет ROI', style='CardMuted.TLabel', wraplength=135).pack(side='left', anchor='center')
-        ttk.Separator(aside, orient='horizontal').pack(fill='x', pady=(0, 10))
-        ttk.Label(aside, text='ROI / GEOMETRY', style='Eyebrow.TLabel').pack(anchor='w')
-        ttk.Label(aside, text='Активная область', style='CardTitle.TLabel').pack(anchor='w', pady=(3, 5))
-        ttk.Label(aside, textvariable=self.preview_rgb_var, style='CardMuted.TLabel').pack(anchor='w')
-        ttk.Label(aside, text='Перемещайте контур на изображении или редактируйте координаты слева.',
-                  style='CardMuted.TLabel', wraplength=215, justify='left').pack(anchor='w', pady=(8, 0))
+        ):
+            ttk.Label(readout, text=code, style=value_style).pack(side='left')
+            ttk.Label(readout, textvariable=value_var, style='CardMuted.TLabel').pack(side='left', padx=(2, 10))
+        ttk.Label(readout, textvariable=self.preview_rgb_var, style='CardMuted.TLabel').pack(side='right')
+        self.preview_rgb_canvas = tk.Canvas(frame_chart, height=165, highlightthickness=1)
+        self.preview_rgb_canvas.pack(fill='x')
 
         try:
             self._apply_start_theme()
@@ -858,6 +839,26 @@ class SetupApp:
         new_val = max(min_val, min(max_val, current + delta))
         var.set(new_val)
         self.update_coord_label()
+
+    def _current_source_text(self):
+        """Active video source (device index, detector id, or file path)."""
+        var = getattr(self, 'source_var', None)
+        if var is not None:
+            try:
+                return str(var.get()).strip()
+            except Exception:
+                pass
+        return str(self.config.get('source', '')).strip()
+
+    def _set_source_text(self, value):
+        text = str(value)
+        var = getattr(self, 'source_var', None)
+        if var is not None:
+            try:
+                var.set(text)
+            except Exception:
+                pass
+        self.config['source'] = text
 
     def safe_get_int(self, var, fallback=0):
         try:
@@ -1155,8 +1156,7 @@ class SetupApp:
         except Exception:
             pass
 
-        self.entry_source.delete(0, tk.END)
-        self.entry_source.insert(0, clean_path)
+        self._set_source_text(clean_path)
         self.config["source"] = clean_path
         self.config["source_is_file"] = True
         self.devices_label.config(text=f"Выбран видеофайл: {os.path.basename(clean_path)}")
@@ -1190,8 +1190,7 @@ class SetupApp:
         if not os.path.isfile(clean_path):
             messagebox.showerror("Ошибка", f"Файл не найден:\n{clean_path}", parent=self.root)
             return
-        self.entry_source.delete(0, tk.END)
-        self.entry_source.insert(0, clean_path)
+        self._set_source_text(clean_path)
         self.config["source"] = clean_path
         self.config["source_is_file"] = True
         self.devices_label.config(text=f"Выбран видеофайл: {os.path.basename(clean_path)}")
@@ -1225,8 +1224,7 @@ class SetupApp:
                     # Auto select and open first detector
                     first_src = self.devices_combined[0][0]
                     first_name = self.devices_combined[0][1]
-                    self.entry_source.delete(0, tk.END)
-                    self.entry_source.insert(0, str(first_src))
+                    self._set_source_text(str(first_src))
                     self.config['source'] = str(first_src)
                     self.devices_label.config(text=f"Выбранное устройство: {first_name} ({first_src})")
                     self.devices_listbox.selection_clear(0, tk.END)
@@ -1236,8 +1234,7 @@ class SetupApp:
                 else:
                     self.devices_combined.append(("miicam:0", "💡 RGB-детектор (Канал 0)"))
                     self.devices_listbox.insert(tk.END, "💡 RGB-детектор (Канал 0) — Нажмите для подключения")
-                    self.entry_source.delete(0, tk.END)
-                    self.entry_source.insert(0, "miicam:0")
+                    self._set_source_text("miicam:0")
                     self.config['source'] = "miicam:0"
                     self.devices_label.config(text="Выбранное устройство: 💡 RGB-детектор (miicam:0)")
                     self.devices_listbox.selection_clear(0, tk.END)
@@ -1324,8 +1321,7 @@ class SetupApp:
 
             if selected_idx >= 0:
                 target_src, target_name = self.devices_combined[selected_idx]
-                self.entry_source.delete(0, tk.END)
-                self.entry_source.insert(0, str(target_src))
+                self._set_source_text(str(target_src))
                 self.config['source'] = str(target_src)
                 self.devices_label.config(text=f"Выбранное устройство: {target_name} ({target_src})")
                 self.devices_listbox.selection_clear(0, tk.END)
@@ -1333,8 +1329,7 @@ class SetupApp:
                 self.devices_listbox.activate(selected_idx)
             elif self.devices_combined:
                 first_src, first_name = self.devices_combined[0]
-                self.entry_source.delete(0, tk.END)
-                self.entry_source.insert(0, str(first_src))
+                self._set_source_text(str(first_src))
                 self.config['source'] = str(first_src)
                 self.devices_label.config(text=f"Выбранное устройство: {first_name} ({first_src})")
                 self.devices_listbox.selection_clear(0, tk.END)
@@ -1343,48 +1338,6 @@ class SetupApp:
                 self.open_camera_source(str(first_src), verbose=False)
         else:
             self.devices_listbox.insert(tk.END, "❌ USB-камеры не найдены")
-
-    def scan_network_cameras(self):
-        self.devices_listbox.delete(0, tk.END)
-        self.devices_listbox.insert(tk.END, "📱 Сканирование сети...")
-
-        def _scan_thread():
-            ip_list = scan_ip_cameras()
-            try:
-                self.root.after(0, lambda: self._on_network_cameras_scanned(ip_list))
-            except Exception:
-                pass
-
-        threading.Thread(target=_scan_thread, daemon=True).start()
-
-    def _on_network_cameras_scanned(self, ip_list):
-        if not hasattr(self, 'devices_listbox'):
-            return
-        self.devices_listbox.delete(0, tk.END)
-        self.devices_combined = []
-        self.ip_camera_list = ip_list
-        if self.ip_camera_list:
-            for url, name in self.ip_camera_list:
-                display = f"{name} — {url}"
-                self.devices_listbox.insert(tk.END, display)
-                self.devices_combined.append((url, name))
-        else:
-            self.devices_listbox.insert(tk.END, "❌ IP-камеры не найдены")
-        if getattr(self, 'camera_list', None):
-            if self.camera_list:
-                for idx, name in self.camera_list:
-                    display = f"[{idx}] {name}"
-                    self.devices_listbox.insert(tk.END, display)
-                    self.devices_combined.append((idx, name))
-        if self.devices_combined:
-            first_src = self.devices_combined[0][0]
-            self.entry_source.delete(0, tk.END)
-            self.entry_source.insert(0, str(first_src))
-            self.devices_label.config(text=f"Выбранное устройство: {self.devices_combined[0][1]} ({first_src})")
-            self.devices_listbox.selection_clear(0, tk.END)
-            self.devices_listbox.selection_set(0)
-            self.devices_listbox.activate(0)
-            self.open_camera_source(str(first_src), verbose=False)
 
     def open_camera_source(self, source, verbose=True):
         try:
@@ -1436,14 +1389,14 @@ class SetupApp:
                         ret, frame = read_valid_frame(cap, attempts=10)
                         if ret and frame is not None:
                             self.config['source'] = repaired
-                            self.entry_source.delete(0, tk.END)
-                            self.entry_source.insert(0, repaired)
+                            self._set_source_text(repaired)
                             source_clean = repaired
             elif is_net:
                 cap = create_video_capture(source_clean)
                 ret, frame = read_valid_frame(cap, attempts=20)
             elif is_miicam_source(source_clean):
-                cap, frame, backend = open_camera_device(source_clean, width=None, height=None, max_attempts=20)
+                det_w, det_h = self._choose_detector_resolution(source_clean)
+                cap, frame, backend = open_camera_device(source_clean, width=det_w, height=det_h, max_attempts=20)
                 ret = (cap is not None and cap.isOpened() and frame is not None and frame.size > 0)
             else:
                 try:
@@ -1467,7 +1420,14 @@ class SetupApp:
                         pass
 
                 h, w = frame.shape[:2]
-                if not is_file and not is_net and not is_miicam_source(source_clean):
+                if not is_file and not is_net:
+                    if is_miicam_source(source_clean) and hasattr(cap, 'get_available_resolutions'):
+                        try:
+                            det_modes = filter_supported_resolutions(cap.get_available_resolutions())
+                            if det_modes:
+                                self._camera_resolution_cache[source_clean] = det_modes
+                        except Exception:
+                            pass
                     self._update_resolution_auto_label(w, h, source_clean)
                 self.cap = cap
                 self.latest_frame = frame.copy()
@@ -1529,6 +1489,42 @@ class SetupApp:
                 messagebox.showerror("❌ Ошибка", str(e), parent=self.root)
         return False
 
+    def _populate_resolution_combo(self, modes, actual=None):
+        """Fill the resolution combo with modes from 640x480 up to the device maximum."""
+        modes = filter_supported_resolutions(modes)
+        auto_label = 'Авто (рекомендуемое)'
+        if actual is not None:
+            try:
+                auto_label = 'Авто (рекомендуемое: %d×%d)' % (int(actual[0]), int(actual[1]))
+            except Exception:
+                pass
+        values = [auto_label] + [f'{w}×{h}' for w, h in modes]
+        if hasattr(self, 'resolution_combo'):
+            self._resolution_combo_updating = True
+            try:
+                self.resolution_combo['values'] = values
+                choice = str(self.config.get('camera_resolution', 'auto'))
+                self.resolution_var.set(
+                    auto_label if choice == 'auto' else choice.replace('x', '×')
+                )
+            finally:
+                self._resolution_combo_updating = False
+        if hasattr(self, 'resolution_status'):
+            if modes:
+                self.resolution_status.config(
+                    text='Доступно режимов: %d (от 640×480 до %d×%d). По умолчанию — рекомендуемое.' % (
+                        len(modes), modes[-1][0], modes[-1][1])
+                )
+            else:
+                self.resolution_status.config(
+                    text='Устройство не отдало список режимов; используется его рекомендуемый режим.'
+                )
+        return modes
+
+    def _chosen_resolution(self, modes):
+        """(width, height) for the current combo choice, or the recommended mode for Auto."""
+        return choose_resolution(modes, self.config.get('camera_resolution', 'auto'))
+
     def _probe_and_choose_resolution(self, source_clean):
         """Discover common UVC modes once per camera and choose a safe default."""
         try:
@@ -1541,32 +1537,34 @@ class SetupApp:
                 self.root.update_idletasks()
             modes = probe_supported_camera_resolutions(index)
             self._camera_resolution_cache[index] = modes
-        modes = self._camera_resolution_cache.get(index, [])
-        values = ['Авто (рекомендуемое)'] + [f'{w}×{h}' for w, h in modes]
-        if hasattr(self, 'resolution_combo'):
-            self._resolution_combo_updating = True
-            self.resolution_combo['values'] = values
-            self._resolution_combo_updating = False
-        if hasattr(self, 'resolution_status'):
-            self.resolution_status.config(
-                text=('Найдено режимов: %d. Авто выберет лучший до 1280×720.' % len(modes))
-                     if modes else 'Камера не отдала список режимов; используется её автоматический режим.'
-            )
-        choice = str(self.config.get('camera_resolution', 'auto'))
-        if choice != 'auto':
+        modes = self._populate_resolution_combo(self._camera_resolution_cache.get(index, []))
+        return self._chosen_resolution(modes)
+
+    def _choose_detector_resolution(self, source_clean):
+        """Modes for the MiiCam/ToupCam detector; Auto keeps the device-recommended mode."""
+        modes = self._camera_resolution_cache.get(source_clean)
+        if modes is None:
+            modes = []
             try:
-                w, h = [int(x) for x in choice.lower().split('x')]
-                if (w, h) in modes:
-                    return w, h
+                from ..utils.miicam_wrapper import enumerate_miicam_devices
+                index = 0
+                if ':' in str(source_clean):
+                    try:
+                        index = int(str(source_clean).split(':', 1)[1])
+                    except ValueError:
+                        index = 0
+                devices = enumerate_miicam_devices()
+                if 0 <= index < len(devices):
+                    modes = filter_supported_resolutions(devices[index].get('resolutions', []))
             except Exception:
-                pass
-        # Prefer highest tested mode that stays within the balanced 720p budget.
-        balanced = [m for m in modes if m[0] <= 1280 and m[1] <= 720]
-        if balanced:
-            return max(balanced, key=lambda m: m[0] * m[1])
-        if modes:
-            return min(modes, key=lambda m: (m[0] * m[1], m[0]))
-        return None, None
+                modes = []
+            self._camera_resolution_cache[source_clean] = modes
+        modes = self._populate_resolution_combo(modes)
+        if str(self.config.get('camera_resolution', 'auto')) == 'auto':
+            # Width/height stay unset: MiiCamCapture then selects its own
+            # recommended live mode instead of forcing a possibly heavy mode.
+            return None, None
+        return self._chosen_resolution(modes)
 
     def _update_resolution_auto_label(self, width, height, source_clean):
         """Show the actual negotiated size alongside Auto and retain detected modes."""
@@ -1577,13 +1575,7 @@ class SetupApp:
         except (TypeError, ValueError):
             source_key = source_clean
         modes = self._camera_resolution_cache.get(source_key, [])
-        auto_label = 'Авто (авто: %d×%d)' % (int(width), int(height))
-        values = [auto_label] + [('%d×%d' % mode) for mode in modes]
-        self._resolution_combo_updating = True
-        self.resolution_combo['values'] = values
-        if str(self.config.get('camera_resolution', 'auto')) == 'auto':
-            self.resolution_var.set(auto_label)
-        self._resolution_combo_updating = False
+        self._populate_resolution_combo(modes, actual=(width, height))
 
     def on_resolution_selected(self, event=None):
         if getattr(self, '_resolution_combo_updating', False):
@@ -1594,37 +1586,29 @@ class SetupApp:
         else:
             self.config['camera_resolution'] = selected.replace('×', 'x')
         self._save_current_settings()
-        # Re-open with the new mode; the cached capability probe avoids re-scanning.
-        if getattr(self, 'entry_source', None) is not None:
-            source = self.entry_source.get().strip()
-            if source:
-                self.root.after(50, lambda: self.open_camera_source(source, verbose=False))
-
-    def check_camera(self):
-        source = self.entry_source.get().strip()
-        self.open_camera_source(source, verbose=True)
-
-    def apply_source(self):
-        source = self.entry_source.get().strip()
+        source = self._current_source_text()
         if not source:
-            messagebox.showerror("Ошибка", "Пустое поле источника", parent=self.root)
             return
-        self.config['source'] = source
-
-        success = self.open_camera_source(source, verbose=False)
-        if success:
-            try:
-                display_name = source
-                for s, name in getattr(self, 'devices_combined', []):
-                    if str(s) == str(source) or s == source:
-                        display_name = name
-                        break
-                self.devices_label.config(text=f"Выбранное устройство: {display_name}")
-            except Exception:
-                pass
-            messagebox.showinfo("Применено", "Источник видео применён", parent=self.root)
-        else:
-            messagebox.showwarning("Внимание", "Источник сохранён, но подключиться не удалось", parent=self.root)
+        # The RGB detector can switch sensor modes in place; reopening the
+        # USB device here would risk the known ERROR_BUSY reopen race and
+        # would interrupt the preview stream.
+        cap = getattr(self, 'cap', None)
+        if is_miicam_source(source) and cap is not None and hasattr(cap, 'set_resolution'):
+            modes = filter_supported_resolutions(
+                self._camera_resolution_cache.get(source, [])
+            )
+            target = self._chosen_resolution(modes)
+            if target and target[0]:
+                try:
+                    if cap.set_resolution(int(target[0]), int(target[1])):
+                        actual = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                        self._update_resolution_auto_label(actual[0], actual[1], source)
+                        return
+                except Exception:
+                    pass
+        # USB cameras: re-open with the new mode; the cached capability
+        # probe avoids re-scanning every mode again.
+        self.root.after(50, lambda: self.open_camera_source(source, verbose=False))
 
     def on_device_select(self, event):
         sel = event.widget.curselection()
@@ -1635,8 +1619,7 @@ class SetupApp:
             self.devices_label.config(text="Выбранное устройство: —")
             return
         src, name = self.devices_combined[idx]
-        self.entry_source.delete(0, tk.END)
-        self.entry_source.insert(0, str(src))
+        self._set_source_text(str(src))
         self.config['source'] = str(src)
         self.devices_label.config(text=f"Выбранное устройство: {name} ({src})")
         self.open_camera_source(str(src), verbose=False)
@@ -1823,12 +1806,8 @@ class SetupApp:
         self.preview_r_var.set(f"{mean_r:0.1f}")
         self.preview_g_var.set(f"{mean_g:0.1f}")
         self.preview_b_var.set(f"{mean_b:0.1f}")
-        if np.isfinite(log_br):
-            self.preview_log_var.set(f"Log10(B/R): {log_br: .4f}")
-            self.preview_log_value_var.set(f"{log_br:+.4f}")
-        else:
-            self.preview_log_var.set("Log10(B/R): —")
-            self.preview_log_value_var.set("—")
+        # log_br is kept in the history tuple for internal calculations and
+        # export only; it is not displayed in the setup window.
         try:
             canvas = self.preview_color_canvas
             canvas.delete('all')
@@ -1891,9 +1870,12 @@ class SetupApp:
         if not getattr(self, 'is_running', False):
             return
         try:
-            if getattr(self, 'roi_drag', False):
-                return
-
+            # Never freeze on the drag-start frame: capture runs in
+            # PreviewWorker (a separate thread) and this refresh must keep
+            # consuming its latest frame while the ROI is being dragged, and
+            # after any desktop window move.  Only the newest frame is kept,
+            # so a busy GUI thread drops stale frames instead of replaying
+            # them (which used to look like a frozen / interrupted stream).
             raw_frame = None
             if getattr(self, 'preview_worker', None) is not None:
                 raw_frame = self.preview_worker.get_latest_frame()
@@ -1996,21 +1978,17 @@ class SetupApp:
                 fps_str = f"FPS: {fps_val:.0f}" if fps_val > 0 else "FPS: 60"
                 overlay_lines = [
                     f"ROI RGB  R: {pr:4.1f}  G: {pg:4.1f}  B: {pb:4.1f} | {fps_str}",
-                    f"Log10(B/R): {plog: .4f}",
                 ]
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.49
                 thickness = 1
                 (tw1, th1), _ = cv2.getTextSize(overlay_lines[0], font, font_scale, thickness)
-                (tw2, th2), _ = cv2.getTextSize(overlay_lines[1], font, font_scale, thickness)
-                box_w = max(tw1, tw2) + 20
-                box_h = th1 + th2 + 22
+                box_w = tw1 + 20
+                box_h = th1 + 16
                 cv2.rectangle(preview_frame, (10, 10), (10 + box_w, 10 + box_h), (38, 48, 42), -1)
                 cv2.rectangle(preview_frame, (10, 10), (10 + box_w, 10 + box_h), (94, 122, 110), 1)
                 cv2.putText(preview_frame, overlay_lines[0], (16, 10 + th1 + 5),
                             font, font_scale, (238, 244, 241), thickness, cv2.LINE_AA)
-                cv2.putText(preview_frame, overlay_lines[1], (16, 10 + th1 + th2 + 14),
-                            font, font_scale, (203, 219, 212), thickness, cv2.LINE_AA)
 
                 rgb_frame = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
                 img = Image.fromarray(rgb_frame)
@@ -2038,7 +2016,7 @@ class SetupApp:
             ph = min(ph, 540)
 
             colors = getattr(self, '_ui_palette', get_palette(bool(self.config.get('light_theme', False))))
-            source = str(self.entry_source.get()).strip() if hasattr(self, 'entry_source') else ''
+            source = self._current_source_text()
             roi_width = self.safe_get_int(self.var_w, 200)
             roi_height = self.safe_get_int(self.var_h, 200)
             cache_key = (pw, ph, bool(self.config.get('light_theme', False)), source, roi_width, roi_height)
@@ -2111,7 +2089,7 @@ class SetupApp:
             box = draw.textbbox((0, 0), hint, font=font_body)
             draw.text((cx - (box[2] - box[0]) / 2, title_y + 31), hint, font=font_body, fill=muted)
 
-            source = str(self.entry_source.get()).strip() if hasattr(self, 'entry_source') else ''
+            source = self._current_source_text()
             source_text = f'SOURCE  {source or "—"}'
             draw.text((inset + 3, inset + 4), source_text, font=font_mono, fill=muted)
             draw.text((pw - inset - 95, inset + 4), 'STANDBY  ·  0 FPS', font=font_mono, fill=muted)
@@ -2146,7 +2124,7 @@ class SetupApp:
             self.open_license_dialog(block_if_expired=False)
             return
 
-        self.config['source'] = self.entry_source.get().strip()
+        self.config['source'] = self._current_source_text()
         # The analysis button may be launched while the startup preview is
         # still holding a camera capture. A selected video file must always
         # get its own capture object; never reuse the previously opened camera.

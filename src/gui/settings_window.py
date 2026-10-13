@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
     "show_r": True,
     "show_g": True,
     "show_b": True,
-    "show_log": True,
+    "show_log": False,
     "show_slope": True,
     "show_transition": True,
     "antialias": False,
@@ -194,7 +194,7 @@ class SettingsWindow:
         )
 
         self.win = tk.Toplevel(parent)
-        self.win.title("Параметры и настройки анализа")
+        self.win.title("Настройки анализа")
         self.win.geometry("1020x760")
         self.win.minsize(920, 680)
         self.win.resizable(True, True)
@@ -429,7 +429,6 @@ class SettingsWindow:
             ("show_r", "Показывать Red (R)"),
             ("show_g", "Показывать Green (G)"),
             ("show_b", "Показывать Blue (B)"),
-            ("show_log", "Показывать Log10(B/R), Log10(B/G)"),
             ("show_slope", "Показывать скорость изменения RGB_sum_slope_30s"),
             ("show_transition", "Показывать индекс перехода (Transition score)"),
         ]
@@ -2167,7 +2166,7 @@ class SettingsWindow:
         def _do_edit_cond():
             sel = tree_c.selection()
             if not sel:
-                messagebox.showinfo("Параметры", "Выберите параметр из списка для изменения", parent=dlg)
+                messagebox.showinfo("Настройки", "Выберите параметр из списка для изменения", parent=dlg)
                 return
             idx = int(sel[0])
             try:
@@ -2559,6 +2558,9 @@ class SettingsWindow:
             ),
             "player_hud_metrics": list(self.config.get("player_hud_metrics", DEFAULT_PLAYER_HUD_METRICS)),
         }
+        # Log10 plots are not displayed; their values are still computed,
+        # stored in CSV/Excel and available to custom formulas.
+        values["show_log"] = False
         self.config.update(values)
         if not self._legacy_preset_compat:
             self.config.pop("detector_presets", None)

@@ -16,8 +16,8 @@ class ProjectManagerDialog:
         self.selected_store = None
         self.win = tk.Toplevel(parent)
         self.win.title("Проекты · ELUTEC")
-        self.win.geometry("950x520")
-        self.win.minsize(820, 420)
+        self.win.geometry("1020x560")
+        self.win.minsize(880, 460)
         self.win.transient(parent)
         self.win.grab_set()
         self.win.protocol("WM_DELETE_WINDOW", self.close)

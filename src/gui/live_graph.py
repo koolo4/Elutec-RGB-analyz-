@@ -183,7 +183,7 @@ class LiveGraphWindow:
         self.track_btn.setToolTip('Автообзор графика. Ручное масштабирование переключает режим в Manual.')
         self.log_btn = QtWidgets.QPushButton('Log B/R · B/G')
         self.log_btn.setCheckable(True)
-        self.log_btn.setChecked(True)
+        self.log_btn.setChecked(False)
         self.refresh_btn = QtWidgets.QPushButton('Обновить')
         self.refresh_btn.setCheckable(False)
         self.refresh_btn.setToolTip('Перерисовать графики, не сбрасывая ручной масштаб в режиме Manual.')
@@ -475,6 +475,11 @@ class LiveGraphWindow:
         self._apply_log_y_ranges()
         self._register_graph_widget('Log10(B/R)', self.log_plot_widget, kind='log')
         self._register_graph_widget('Log10(B/G)', self.log_bg_plot_widget, kind='log')
+        # Log10 plots are hidden by default (values are still computed and
+        # exported); the toolbar toggle can still reveal them on demand.
+        for _item in self._graph_items:
+            if _item.get('kind') == 'log':
+                _item['visible'] = False
         # Direct range sync used
         # Direct range sync used
 
@@ -545,7 +550,7 @@ class LiveGraphWindow:
         self._video_resize_request = None
         self._autoscroll = True
         self._ignore_view_change = False
-        self.show_log = True
+        self.show_log = False
 
                               
         self.btn_r.toggled.connect(lambda checked: self._on_channel_toggle('r', checked))
