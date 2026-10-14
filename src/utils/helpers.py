@@ -501,6 +501,99 @@ def choose_resolution(modes, choice="auto"):
     return recommended_resolution(ordered)
 
 
+MAX_PREVIEW_UPSCALE = 3.0
+
+
+def preview_view_geometry(label_width, label_height, frame_width, frame_height,
+                          max_upscale=MAX_PREVIEW_UPSCALE):
+    """Geometry that maps camera pixels onto the preview label.
+
+    The preview keeps the frame aspect ratio and is drawn centred inside the
+    label, so mouse coordinates must be shifted by the letterbox offset before
+    being divided by the scale.  Both values are returned here so the render
+    loop and the ROI mouse handlers always agree.
+
+    Returns a dict with ``scale``, ``offset_x``, ``offset_y``, ``disp_w``,
+    ``disp_h``, ``frame_w`` and ``frame_h``.
+    """
+    try:
+        label_width = float(label_width)
+        label_height = float(label_height)
+        frame_width = float(frame_width)
+        frame_height = float(frame_height)
+    except (TypeError, ValueError):
+        return None
+    if label_width <= 1 or label_height <= 1 or frame_width <= 0 or frame_height <= 0:
+        return None
+
+    scale = min(label_width / frame_width, label_height / frame_height)
+    if not np.isfinite(scale) or scale <= 0:
+        return None
+    # Small sensors are allowed to fill the card, but only up to a sane limit
+    # (a 320x240 stream must not be blown up 6x).
+    scale = min(scale, float(max_upscale))
+    disp_w = max(1, int(round(frame_width * scale)))
+    disp_h = max(1, int(round(frame_height * scale)))
+    return {
+        'scale': scale,
+        'offset_x': max(0.0, (label_width - disp_w) / 2.0),
+        'offset_y': max(0.0, (label_height - disp_h) / 2.0),
+        'disp_w': disp_w,
+        'disp_h': disp_h,
+        'frame_w': int(round(frame_width)),
+        'frame_h': int(round(frame_height)),
+    }
+
+
+def preview_point_to_frame(view, x, y, clamp=False):
+    """Convert label pixels to camera pixels using :func:`preview_view_geometry`.
+
+    Returns ``(x, y)`` in frame coordinates, or ``None`` when the point falls
+    on the empty margin next to the letterboxed image (unless *clamp* is set,
+    which is what dragging uses when the pointer leaves the image).
+    """
+    if not view:
+        return None
+    scale = float(view.get('scale') or 0.0)
+    frame_w = float(view.get('frame_w') or 0.0)
+    frame_h = float(view.get('frame_h') or 0.0)
+    if scale <= 0.0 or frame_w <= 0.0 or frame_h <= 0.0:
+        return None
+    fx = (float(x) - float(view.get('offset_x', 0.0))) / scale
+    fy = (float(y) - float(view.get('offset_y', 0.0))) / scale
+    if clamp:
+        fx = min(max(fx, 0.0), frame_w)
+        fy = min(max(fy, 0.0), frame_h)
+    elif fx < 0.0 or fy < 0.0 or fx > frame_w or fy > frame_h:
+        return None
+    return int(round(fx)), int(round(fy))
+
+
+def preview_handle_tolerance(scale, min_tolerance=12, target_px=9, roi_size=None):
+    """Resize-handle tolerance in frame pixels for a comfortable screen hit area.
+
+    On a 3072x2048 sensor shown at ~0.11x a fixed 12 px tolerance is barely one
+    screen pixel, so the tolerance grows as the preview shrinks.  It is capped
+    (optionally by *roi_size*) so the interior of a small ROI stays draggable.
+    """
+    try:
+        min_tolerance = int(min_tolerance)
+        target_px = float(target_px)
+        scale = float(scale)
+    except (TypeError, ValueError):
+        return 12
+    if scale <= 0.0 or not np.isfinite(scale):
+        return min_tolerance
+    # Round up: the tolerance must always cover *target_px* screen pixels.
+    tolerance = max(min_tolerance, int(np.ceil(target_px / scale)))
+    if roi_size:
+        try:
+            tolerance = min(tolerance, max(min_tolerance, int(float(roi_size) * 0.25)))
+        except (TypeError, ValueError):
+            pass
+    return tolerance
+
+
 def probe_supported_camera_resolutions(index, max_attempts=3):
     """Probe common camera modes through real frame capture.
 

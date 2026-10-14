@@ -1,4 +1,5 @@
 import json
+import math
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from .settings_window import SettingsWindow, load_saved_settings, save_settings
@@ -20,7 +21,8 @@ from ..utils.helpers import (
     read_valid_frame, verify_capture_can_read, is_network_source, is_placeholder_frame, is_miicam_source,
     ivcam_setup_hint, get_default_save_folder, get_local_ip,
     camera_label, camera_priority, is_ivcam_name, is_iriun_name, is_video_file_source, is_video_file_path, repair_video_file_if_needed, open_video_file_capture, probe_supported_camera_resolutions,
-    filter_supported_resolutions, choose_resolution
+    filter_supported_resolutions, choose_resolution,
+    preview_view_geometry, preview_point_to_frame, preview_handle_tolerance
 )
 from ..utils.ffmpeg_utils import ensure_pyqt5_platform_plugin_path
 from ..analysis.runner import run_analysis
@@ -128,6 +130,12 @@ class SetupApp:
         self.root.title("Элютек · SARA RGB анализ")
         self.root.geometry("1480x900")
         self.root.minsize(1180, 720)
+        # The capture card is the primary instrument, so start with the largest
+        # frame the display can give it (silently ignored where unsupported).
+        try:
+            self.root.state('zoomed')
+        except Exception:
+            pass
         
         default_save = get_default_save_folder()
         self.config = {
@@ -248,6 +256,10 @@ class SetupApp:
         self.preview_scale = 1.0
         self.preview_width = 640
         self.preview_height = 480
+        # Scale + letterbox offsets linking preview-label pixels to camera
+        # pixels.  Kept in sync by update_preview() and consumed by the ROI
+        # mouse handlers, otherwise dragging lands on the wrong frame point.
+        self._preview_view = None
         self.roi_shape = str(self.config.get('roi_shape', 'circle'))
         self.roi_drag = False
         self.roi_action = None
@@ -255,6 +267,7 @@ class SetupApp:
         self.roi_orig = (0, 0, 0, 0)
         self.roi_handle = None
         self.HANDLE_SIZE = 12
+        self.HANDLE_HIT_PX = 9
         self.MIN_ROI_SIZE = 20
 
                           
@@ -363,6 +376,16 @@ class SetupApp:
                         bordercolor=border, padding=(9, 6), font=('Segoe UI', 9, 'bold'))
         style.map('Quiet.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
                   bordercolor=[('active', accent)])
+        # Compact icon-only button (theme / licence) and the project-name
+        # switcher that reads like a heading but opens the project picker.
+        style.configure('Icon.TButton', background=surface, foreground=fg, borderwidth=1,
+                        bordercolor=border, padding=(7, 6))
+        style.map('Icon.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
+                  bordercolor=[('active', accent)])
+        style.configure('ProjectLink.TButton', background=surface, foreground=fg, borderwidth=0,
+                        padding=(0, 1), anchor='w', font=('Segoe UI', 15, 'bold'))
+        style.map('ProjectLink.TButton', background=[('pressed', surface), ('active', surface)],
+                  foreground=[('active', accent)])
         style.configure('Small.TButton', background=surface_alt, foreground=muted, borderwidth=0,
                         padding=(5, 3), font=('Segoe UI', 8, 'bold'))
         style.map('Small.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
@@ -459,10 +482,9 @@ class SetupApp:
             except Exception:
                 pass
         if hasattr(self, 'theme_btn'):
-            try:
-                self.theme_btn.config(text='Тёмная тема' if light else 'Светлая тема')
-            except Exception:
-                pass
+            # Icon follows the *target* theme: a sun is offered while the dark
+            # palette is active, a moon while the light one is.
+            self._refresh_header_icons()
         if hasattr(self, 'brand_canvas'):
             self._draw_brand_mark()
         self._update_license_ui()
@@ -486,15 +508,23 @@ class SetupApp:
     def _update_license_ui(self):
         if not hasattr(self, 'lic_btn'):
             return
+        colors = getattr(self, '_ui_palette', get_palette(False))
         try:
             status = self.lic_mgr.get_status()
             st = status.get('status')
             if st == LICENSE_STATUS_LICENSED:
-                self.lic_btn.config(text="Лицензия · PRO")
+                text = 'Лицензия активирована · PRO'
+                tone = colors.get('success', colors['accent'])
             elif st == LICENSE_STATUS_TRIAL_ACTIVE:
-                self.lic_btn.config(text=f"Демо · {status.get('days_left', 0)} дн.")
+                text = f"Демо-режим · осталось {status.get('days_left', 0)} дн. · нажмите, чтобы активировать"
+                tone = colors.get('warning', colors['accent'])
             else:
-                self.lic_btn.config(text="Активировать лицензию")
+                text = 'Лицензия не активирована · нажмите, чтобы активировать'
+                tone = colors.get('warning', colors['accent'])
+            self._license_status_text = text
+            icon = self._header_icon('key', color=tone)
+            self.lic_btn.configure(image=icon)
+            self.lic_btn.image = icon
         except Exception:
             pass
 
@@ -544,25 +574,34 @@ class SetupApp:
         ttk.Label(brand_copy, text='ELUTEC  /  LAB SYSTEMS', style='Eyebrow.TLabel').pack(anchor='w')
         ttk.Label(brand_copy, text='SARA RGB', style='Title.TLabel').pack(anchor='w', pady=(1, 0))
         ttk.Separator(header, orient='vertical').pack(side='left', fill='y', padx=(0, 16), pady=3)
+        # The former "working console" caption is replaced by the project
+        # context: the open project name (click = switch project) or the
+        # project picker while nothing is selected.
         header_context = ttk.Frame(header, style='Topbar.TFrame')
-        header_context.pack(side='left', fill='x', expand=True)
-        ttk.Label(header_context, text='РАБОЧАЯ КОНСОЛЬ', style='Eyebrow.TLabel').pack(anchor='w')
-        ttk.Label(header_context, text='Визуальный контроль фракционирования',
-                  style='Subtitle.TLabel').pack(anchor='w', pady=(2, 0))
-
-        self.project_btn = ttk.Button(
-            header, text='Выбрать проект', command=self.open_project_manager, style='Quiet.TButton'
+        header_context.pack(side='left', fill='both', expand=True)
+        self.project_pick_btn = ttk.Button(
+            header_context, text='Выбрать проект', command=self.open_project_manager, style='Quiet.TButton'
         )
-        self.project_btn.pack(side='right', padx=(7, 0))
-        self.lic_btn = ttk.Button(header, text='Лицензия', command=self.open_license_dialog, style='Quiet.TButton')
+        self.project_name_frame = ttk.Frame(header_context, style='Topbar.TFrame')
+        ttk.Label(self.project_name_frame, text='ТЕКУЩИЙ ПРОЕКТ', style='Eyebrow.TLabel').pack(anchor='w')
+        self.project_name_btn = ttk.Button(
+            self.project_name_frame, text='—', command=self.open_project_manager,
+            style='ProjectLink.TButton', cursor='hand2'
+        )
+        self.project_name_btn.pack(anchor='w')
+        self.project_pick_btn.pack(side='left', pady=(6, 0))
+
+        # Global actions: theme and licence are icon-only so the top-right
+        # corner stays quiet; settings keeps its label.
+        self.lic_btn = ttk.Button(header, text='', command=self.open_license_dialog, style='Icon.TButton')
         self.lic_btn.pack(side='right', padx=(7, 0))
         settings_btn = ttk.Button(header, text='Настройки', command=self.open_settings, style='Secondary.TButton')
         settings_btn.pack(side='right', padx=(7, 0))
-        self.theme_btn = ttk.Button(
-            header, text='Светлая тема' if not self.config.get('light_theme', False) else 'Тёмная тема',
-            command=self.toggle_theme, style='Quiet.TButton'
-        )
+        self.theme_btn = ttk.Button(header, text='', command=self.toggle_theme, style='Icon.TButton')
         self.theme_btn.pack(side='right')
+        self._refresh_header_icons()
+        self._attach_tooltip(self.theme_btn, self._theme_tooltip)
+        self._attach_tooltip(self.lic_btn, self._license_tooltip)
         self._update_license_ui()
 
         body = ttk.Frame(app_shell, style='App.TFrame', padding=(16, 12, 16, 12))
@@ -750,7 +789,7 @@ class SetupApp:
         content = ttk.Frame(right, style='App.TFrame')
         content.pack(fill='both', expand=True)
 
-        frame_prev = ttk.Frame(content, style='Card.TFrame', padding=10)
+        frame_prev = ttk.Frame(content, style='Card.TFrame', padding=10, height=430)
         frame_prev.pack(fill='both', expand=True)
         # Keep preview image requests from changing the parent layout size.
         frame_prev.pack_propagate(False)
@@ -794,7 +833,9 @@ class SetupApp:
             ttk.Label(readout, text=code, style=value_style).pack(side='left')
             ttk.Label(readout, textvariable=value_var, style='CardMuted.TLabel').pack(side='left', padx=(2, 10))
         ttk.Label(readout, textvariable=self.preview_rgb_var, style='CardMuted.TLabel').pack(side='right')
-        self.preview_rgb_canvas = tk.Canvas(frame_chart, height=165, highlightthickness=1)
+        # The history strip stays readable without stealing height from the
+        # video card above it.
+        self.preview_rgb_canvas = tk.Canvas(frame_chart, height=138, highlightthickness=1)
         self.preview_rgb_canvas.pack(fill='x')
 
         try:
@@ -802,6 +843,143 @@ class SetupApp:
         except Exception:
             pass
         self.root.after(200, self.auto_connect_startup_camera)
+
+    def _header_icon(self, name, size=18, color=None):
+        """Draw a small crisp header icon with Pillow (supersampled, cached).
+
+        Icons are painted from the active palette, so sun/moon/key follow the
+        selected theme without shipping any image assets.
+        """
+        colors = getattr(self, '_ui_palette', get_palette(False))
+        color = color or colors['text']
+        cache = getattr(self, '_header_icon_cache', None)
+        if cache is None:
+            cache = {}
+            self._header_icon_cache = cache
+        cache_key = (name, size, color)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        scale = 4
+        px = int(size) * scale
+        image = Image.new('RGBA', (px, px), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        rgb = self._hex_to_rgb(color)
+        # Supersampling needs an explicit alpha, otherwise transparent pixels
+        # are painted opaque black.
+        rgb = (rgb[0], rgb[1], rgb[2], 255)
+        stroke = max(2, int(px * 0.085))
+
+        if name == 'sun':
+            center = px / 2.0
+            radius = px * 0.2
+            draw.ellipse((center - radius, center - radius, center + radius, center + radius), fill=rgb)
+            for step in range(8):
+                angle = math.radians(step * 45)
+                dx, dy = math.cos(angle), math.sin(angle)
+                draw.line((center + px * 0.31 * dx, center + px * 0.31 * dy,
+                           center + px * 0.44 * dx, center + px * 0.44 * dy),
+                          fill=rgb, width=stroke)
+        elif name == 'moon':
+            draw.ellipse((px * 0.08, px * 0.08, px * 0.92, px * 0.92), fill=rgb)
+            # Punch the crescent out of the disc: the cutting circle is offset
+            # far enough for the centre of the disc to stay painted.
+            offset = px * 0.55 * math.cos(math.radians(-45))
+            cut_radius = px * 0.42
+            cut_x = px * 0.5 + offset
+            cut_y = px * 0.5 - offset
+            draw.ellipse((cut_x - cut_radius, cut_y - cut_radius,
+                          cut_x + cut_radius, cut_y + cut_radius), fill=(0, 0, 0, 0))
+        elif name == 'key':
+            ring_x, ring_y, ring_r = px * 0.30, px * 0.70, px * 0.18
+            draw.ellipse((ring_x - ring_r, ring_y - ring_r, ring_x + ring_r, ring_y + ring_r),
+                         outline=rgb, width=stroke)
+            dx, dy = math.cos(math.radians(-45)), math.sin(math.radians(-45))
+            shaft_x, shaft_y = ring_x + ring_r * dx, ring_y + ring_r * dy
+            end_x, end_y = shaft_x + px * 0.44 * dx, shaft_y + px * 0.44 * dy
+            draw.line((shaft_x, shaft_y, end_x, end_y), fill=rgb, width=stroke)
+            tooth_x, tooth_y = -dy, dx
+            for fraction in (0.34, 0.60):
+                base_x = shaft_x + px * 0.44 * fraction * dx
+                base_y = shaft_y + px * 0.44 * fraction * dy
+                draw.line((base_x, base_y, base_x + px * 0.14 * tooth_x, base_y + px * 0.14 * tooth_y),
+                          fill=rgb, width=stroke)
+        else:
+            draw.ellipse((0, 0, px - 1, px - 1), outline=rgb, width=stroke)
+
+        image = image.resize((int(size), int(size)), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        cache[cache_key] = photo
+        return photo
+
+    @staticmethod
+    def _hex_to_rgb(value):
+        text = str(value or '#ffffff').lstrip('#')
+        if len(text) == 3:
+            text = ''.join(channel * 2 for channel in text)
+        try:
+            return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
+        except ValueError:
+            return (255, 255, 255)
+
+    def _refresh_header_icons(self):
+        """Repaint the icon-only header buttons for the current palette."""
+        try:
+            icon = self._header_icon('moon' if bool(self.config.get('light_theme', False)) else 'sun')
+            self.theme_btn.configure(image=icon)
+            self.theme_btn.image = icon
+        except Exception:
+            pass
+
+    def _theme_tooltip(self):
+        target = 'тёмную' if bool(self.config.get('light_theme', False)) else 'светлую'
+        return f'Переключить на {target} тему'
+
+    def _license_tooltip(self):
+        return getattr(self, '_license_status_text', 'Лицензия')
+
+    def _attach_tooltip(self, widget, text_provider):
+        """Minimal hover hint, used by the icon-only header buttons."""
+        def _show(_event=None):
+            self._hide_tooltip()
+            try:
+                text = text_provider() if callable(text_provider) else str(text_provider)
+                if not text:
+                    return
+                colors = getattr(self, '_ui_palette', get_palette(False))
+                tip = tk.Toplevel(self.root)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.attributes('-topmost', True)
+                except Exception:
+                    pass
+                tk.Label(
+                    tip, text=text, background=colors['surface_alt'], foreground=colors['text'],
+                    font=('Segoe UI', 8), padx=8, pady=4, borderwidth=1, relief='solid'
+                ).pack()
+                x = widget.winfo_rootx() + widget.winfo_width() // 2 - 40
+                y = widget.winfo_rooty() + widget.winfo_height() + 6
+                tip.wm_geometry(f'+{max(0, x)}+{max(0, y)}')
+                self._tooltip_window = tip
+            except Exception:
+                self._tooltip_window = None
+
+        try:
+            widget.bind('<Enter>', _show, add='+')
+            widget.bind('<Leave>', self._hide_tooltip, add='+')
+            widget.bind('<ButtonPress>', self._hide_tooltip, add='+')
+        except Exception:
+            pass
+
+    def _hide_tooltip(self, _event=None):
+        tip = getattr(self, '_tooltip_window', None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            self._tooltip_window = None
 
     def _draw_brand_mark(self):
         canvas = getattr(self, 'brand_canvas', None)
@@ -940,15 +1118,29 @@ class SetupApp:
         store = getattr(self, "project_store", None)
         if store and store.manifest:
             name = str(store.manifest.get("name") or store.root.name)
-            short_name = name if len(name) <= 22 else name[:19] + "…"
-            button_text = f"Проект · {short_name}"
             target = str(session_path or (store.root / "sessions"))
+            has_project = True
         else:
-            button_text = "Выбрать проект"
+            name = ""
             target = "Проект не выбран"
-        if hasattr(self, "project_btn"):
+            has_project = False
+
+        # Header slot: the project name is the switcher once a project is open,
+        # otherwise the picker button takes its place.
+        if has_project and hasattr(self, "project_name_btn"):
+            short_name = name if len(name) <= 34 else name[:31] + "…"
             try:
-                self.project_btn.configure(text=button_text)
+                self.project_name_btn.configure(text=f"{short_name}  ▾")
+            except Exception:
+                pass
+        if hasattr(self, "project_pick_btn") and hasattr(self, "project_name_frame"):
+            try:
+                self.project_pick_btn.pack_forget()
+                self.project_name_frame.pack_forget()
+                if has_project:
+                    self.project_name_frame.pack(side='left')
+                else:
+                    self.project_pick_btn.pack(side='left', pady=(6, 0))
             except Exception:
                 pass
         if hasattr(self, "session_path_var"):
@@ -1628,17 +1820,44 @@ class SetupApp:
         self.on_device_select(event)
 
                                                                    
+    def _preview_mouse_to_frame(self, event, clamp=False):
+        """Translate preview-label pixels into camera pixels for the ROI math.
+
+        The rendered image is centred inside the label, so the letterbox offset
+        from :func:`preview_view_geometry` is subtracted before scaling.  This
+        is what makes the ROI grabbable when the frame does not fill the card.
+        """
+        view = getattr(self, '_preview_view', None)
+        if view:
+            # The None result (pointer on the letterbox margin) is meaningful:
+            # callers use it to ignore clicks that are not on the image.
+            return preview_point_to_frame(view, event.x, event.y, clamp=clamp)
+        # Fallback for the very first frame, before a view was measured.
+        if self.preview_scale <= 0:
+            return None
+        return (int(event.x / self.preview_scale), int(event.y / self.preview_scale))
+
+    def _preview_roi_tolerance(self, roi_size=None):
+        view = getattr(self, '_preview_view', None) or {}
+        return preview_handle_tolerance(view.get('scale') or self.preview_scale,
+                                        self.HANDLE_SIZE, self.HANDLE_HIT_PX, roi_size)
+
     def on_preview_mouse_hover(self, event):
         if self.preview_scale <= 0:
             return
-        x = int(event.x / self.preview_scale)
-        y = int(event.y / self.preview_scale)
+        point = self._preview_mouse_to_frame(event)
+        if point is None:
+            # Pointer is on the empty margin beside the image.
+            self.preview_label.config(cursor="arrow")
+            return
+        x, y = point
         x0 = self.safe_get_int(self.var_x, 0)
         y0 = self.safe_get_int(self.var_y, 0)
         w = self.safe_get_int(self.var_w, self.MIN_ROI_SIZE)
         h = self.safe_get_int(self.var_h, self.MIN_ROI_SIZE)
         x1 = x0 + w
         y1 = y0 + h
+        tolerance = self._preview_roi_tolerance(min(w, h))
         if self.roi_shape_var.get() == 'circle':
             cx = x0 + w / 2
             cy = y0 + h / 2
@@ -1646,14 +1865,14 @@ class SetupApp:
             dx = x - cx
             dy = y - cy
             dist = (dx * dx + dy * dy) ** 0.5
-            if dist <= radius + self.HANDLE_SIZE and dist >= radius - self.HANDLE_SIZE:
+            if dist <= radius + tolerance and dist >= radius - tolerance:
                 self.preview_label.config(cursor="fleur")
             elif dist <= radius:
                 self.preview_label.config(cursor="fleur")
             else:
                 self.preview_label.config(cursor="arrow")
         else:
-            handle = self.get_roi_handle(x, y, x0, y0, x1, y1)
+            handle = self.get_roi_handle(x, y, x0, y0, x1, y1, tolerance)
             if handle:
                 cursors = {
                     'top_left': 'size_nw_se',
@@ -1674,8 +1893,13 @@ class SetupApp:
     def on_preview_mouse_down(self, event):
         if self.preview_scale <= 0:
             return
-        x = int(event.x / self.preview_scale)
-        y = int(event.y / self.preview_scale)
+        point = self._preview_mouse_to_frame(event)
+        if point is None:
+            # A press beside the video must not start a phantom drag.
+            self.roi_drag = False
+            self.roi_action = None
+            return
+        x, y = point
         x0 = self.safe_get_int(self.var_x, 0)
         y0 = self.safe_get_int(self.var_y, 0)
         w = self.safe_get_int(self.var_w, self.MIN_ROI_SIZE)
@@ -1684,6 +1908,7 @@ class SetupApp:
         y1 = y0 + h
         self.roi_start = (x, y)
         self.roi_orig = (x0, y0, w, h)
+        tolerance = self._preview_roi_tolerance(min(w, h))
         if self.roi_shape_var.get() == 'circle':
             cx = x0 + w / 2
             cy = y0 + h / 2
@@ -1691,14 +1916,14 @@ class SetupApp:
             dx = x - cx
             dy = y - cy
             dist = (dx * dx + dy * dy) ** 0.5
-            if dist <= radius + self.HANDLE_SIZE and dist >= radius - self.HANDLE_SIZE:
+            if dist <= radius + tolerance and dist >= radius - tolerance:
                 self.roi_action = 'resize_circle'
                 self.roi_drag = True
             elif dist <= radius:
                 self.roi_action = 'move'
                 self.roi_drag = True
             return
-        handle = self.get_roi_handle(x, y, x0, y0, x1, y1)
+        handle = self.get_roi_handle(x, y, x0, y0, x1, y1, tolerance)
         if handle:
             self.roi_action = 'resize'
             self.roi_handle = handle
@@ -1710,8 +1935,9 @@ class SetupApp:
     def on_preview_mouse_move(self, event):
         if not self.roi_drag:
             return
-        x = int(event.x / self.preview_scale)
-        y = int(event.y / self.preview_scale)
+        # During a drag the pointer may leave the image: clamp instead of
+        # dropping the gesture, so dragging stays smooth at the edges.
+        x, y = self._preview_mouse_to_frame(event, clamp=True)
         x0, y0, w, h = self.roi_orig
         x1 = x0 + w
         y1 = y0 + h
@@ -1759,8 +1985,8 @@ class SetupApp:
         self.roi_action = None
         self.roi_handle = None
 
-    def get_roi_handle(self, x, y, x0, y0, x1, y1):
-        th = self.HANDLE_SIZE
+    def get_roi_handle(self, x, y, x0, y0, x1, y1, tolerance=None):
+        th = tolerance if tolerance else self._preview_roi_tolerance(min(x1 - x0, y1 - y0))
         handles = {
             'top_left': (x0, y0),
             'top_right': (x1, y0),
@@ -1906,18 +2132,26 @@ class SetupApp:
                 # a 1200x800 size that forces the entire window to grow.
                 if preview_width <= 1 or preview_height <= 1:
                     return
-                scale_w = preview_width / width if width > 0 else 1.0
-                scale_h = preview_height / height if height > 0 else 1.0
-                scale = min(scale_w, scale_h, 960.0 / max(1, width), 540.0 / max(1, height), 1.0)
+                # Fill the capture card as far as the aspect ratio allows, then
+                # remember the scale and the letterbox offsets: the ROI mouse
+                # handlers divide by exactly these values, otherwise a click is
+                # mapped to the wrong frame pixel and the ROI cannot be grabbed.
+                view = preview_view_geometry(preview_width, preview_height, width, height)
+                if view is None:
+                    return
+                self._preview_view = view
+                scale = view['scale']
+                new_width = view['disp_w']
+                new_height = view['disp_h']
                 self.preview_scale = scale
                 self.preview_width = width
                 self.preview_height = height
                 self.update_coord_label()
 
-                # Fast preview downscale first for 60+ FPS high-throughput rendering
-                new_width = max(10, int(width * scale))
-                new_height = max(10, int(height * scale))
-                preview_frame = cv2.resize(raw_frame, (new_width, new_height))
+                # INTER_AREA keeps a high-resolution sensor from aliasing when
+                # it is squeezed into the card; small frames may be enlarged.
+                interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                preview_frame = cv2.resize(raw_frame, (new_width, new_height), interpolation=interpolation)
 
                 # Periodically compute accurate ROI RGB stats
                 now_preview = time.time()

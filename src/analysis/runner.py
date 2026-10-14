@@ -631,8 +631,20 @@ def run_analysis(config, parent=None, cap=None):
                 return
             frame_w = max(1, int(roi_drag.get('frame_w', video_window_w)))
             frame_h = max(1, int(roi_drag.get('frame_h', video_window_h)))
-            sx = frame_w / max(1, video_window_w)
-            sy = frame_h / max(1, video_window_h)
+            # The operator can resize the preview window (or the desktop move
+            # re-lays it out): map clicks through the *live* window size instead
+            # of the size requested at start-up, otherwise the ROI drifts.
+            window_w, window_h = video_window_w, video_window_h
+            try:
+                get_rect = getattr(cv2, 'getWindowImageRect', None)
+                if get_rect is not None:
+                    _wx, _wy, live_w, live_h = get_rect(WINDOW_NAME)
+                    if live_w > 0 and live_h > 0:
+                        window_w, window_h = live_w, live_h
+            except Exception:
+                pass
+            sx = frame_w / max(1, window_w)
+            sy = frame_h / max(1, window_h)
             x = int(round(mx * sx))
             y = int(round(my * sy))
             x = max(0, min(frame_w - 1, x))
