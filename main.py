@@ -3,6 +3,13 @@ import os
 import warnings
 import traceback
 
+# Avoid UnicodeEncodeError on cp1251 consoles / redirected output when logging emoji.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 

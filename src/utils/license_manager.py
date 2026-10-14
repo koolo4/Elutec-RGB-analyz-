@@ -7,6 +7,8 @@
 - Защиту от ручной подделки и изменения файлов состояния (контрольная сумма HMAC).
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import json

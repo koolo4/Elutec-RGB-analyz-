@@ -231,21 +231,23 @@ def test_project_controls_switch_between_picker_and_name():
 
 def test_theme_and_licence_buttons_are_icons():
     src = _read("src/gui/setup_app.py")
-    # Icon painters for sun / moon / key, drawn from the active palette.
-    for name in ("'sun'", "'moon'", "'key'"):
-        assert name in src
-    assert "def _header_icon" in src
-    assert "def _refresh_header_icons" in src
-    assert "self._header_icon('moon' if bool(self.config.get('light_theme', False)) else 'sun')" in src
-    # Both buttons are created without a text label.
-    assert "self.lic_btn = ttk.Button(header, text='', command=self.open_license_dialog, style='Icon.TButton')" in src
-    assert "self.theme_btn = ttk.Button(header, text='', command=self.toggle_theme, style='Icon.TButton')" in src
+    toolbar = _read("src/gui/header_toolbar.py")
+    # Icon painters for sun / moon / gear / key, drawn from the active palette.
+    for name in ("'sun'", "'moon'", "'gear'", "'key'"):
+        assert name in toolbar
+    assert "def paint_icon" in toolbar
+    assert "class HeaderToolbar" in toolbar
+    # Theme, settings and licence live in one rounded header group.
+    assert "self.header_actions = HeaderToolbar(header, colors).pack(side='right')" in src
+    assert "self.theme_btn = self.header_actions.add(self._theme_icon_name(), self.toggle_theme)" in src
+    assert "self.settings_btn = self.header_actions.add('gear', self.open_settings, text='Настройки')" in src
+    assert "self.lic_btn = self.header_actions.add('key', self.open_license_dialog)" in src
+    assert "return 'moon' if bool(self.config.get('light_theme', False)) else 'sun'" in src
     # No more long text labels for theme / licence states.
     assert "'Светлая тема'" not in src
     assert "'Тёмная тема'" not in src
     assert "Активировать лицензию" not in src
-    # Icon styles exist and tooltips explain the icon-only buttons.
-    assert "style.configure('Icon.TButton'" in src
+    # Tooltips explain the icon-only buttons.
     assert "style.configure('ProjectLink.TButton'" in src
     assert "def _attach_tooltip" in src
     assert "def _theme_tooltip" in src
@@ -258,92 +260,40 @@ def test_licence_icon_colour_tracks_the_licence_status():
     block = src[start:src.index("def open_license_dialog", start)]
     assert "LICENSE_STATUS_LICENSED" in block
     assert "_license_status_text" in block
-    assert "self._header_icon('key'" in block
-    assert "self.lic_btn.configure(image=icon)" in block
+    assert "HeaderToolbar.set_badge(self.lic_btn, tone)" in block
 
 
 # --------------------------------------------------------------------------
 # The icon painters are executed for real (Pillow only, no display needed)
 # --------------------------------------------------------------------------
 
-def _load_icon_painters():
-    """Extract ``_header_icon`` / ``_hex_to_rgb`` from the app and exec them."""
-    import ast
-    import textwrap
-
-    import pytest
-
-    pytest.importorskip("PIL")
-    from PIL import Image, ImageDraw
-
-    source = _read("src/gui/setup_app.py")
-    tree = ast.parse(source)
-    segments = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name in ("_header_icon", "_hex_to_rgb"):
-            segment = ast.get_source_segment(source, node)
-            # ``get_source_segment`` starts at ``def``, so the decorator of the
-            # static helper has to be restored by hand.
-            if node.name == "_hex_to_rgb":
-                segment = "@staticmethod\n" + segment
-            segments.append(segment)
-    assert len(segments) == 2, segments
-
-    class _FakePhotoImage:
-        """Stands in for PIL.ImageTk.PhotoImage and keeps the drawn image."""
-
-        def __init__(self, image=None, **kwargs):
-            self.image = image
-
-    namespace = {
-        "Image": Image,
-        "ImageDraw": ImageDraw,
-        "ImageTk": type("ImageTk", (), {"PhotoImage": _FakePhotoImage}),
-        "math": __import__("math"),
-        "get_palette": lambda light=False: {"text": "#e6edf3", "accent": "#6ea8fe"},
-    }
-    exec("class Icons:\n" + textwrap.indent("\n\n".join(segments), "    "), namespace)
-    return namespace["Icons"]
-
-
 def _paint(name, color="#e6edf3"):
     import numpy as np
 
-    icons = _load_icon_painters()
-    instance = icons()
-    instance._ui_palette = {"text": "#e6edf3", "accent": "#6ea8fe"}
-    photo = icons._header_icon(instance, name, color=color)
-    return np.asarray(photo.image), instance
+    from src.gui.header_toolbar import paint_icon
+
+    return np.asarray(paint_icon(name, 18, color))
 
 
 def test_icon_painters_draw_expected_shapes():
     import numpy as np
 
-    for name in ("sun", "moon", "key"):
-        pixels, _ = _paint(name)
+    for name in ("sun", "moon", "gear", "key"):
+        pixels = _paint(name)
         assert pixels.shape[:2] == (18, 18)
         alpha = pixels[:, :, 3]
         # Something is drawn (visible strokes) on a transparent background.
         assert alpha.max() == 255
         assert (alpha == 0).any()
 
-    sun, _ = _paint("sun")
+    sun = _paint("sun")
     assert int((sun[:, :, 3] > 0).sum()) > 60
     # The moon is a disc with a transparent bite taken out of it.
-    moon, _ = _paint("moon")
+    moon = _paint("moon")
     assert moon[9, 9, 3] == 255
     assert moon[2, 12, 3] == 0
+    # The gear has a hole in the middle.
+    gear = _paint("gear")
+    assert gear[9, 9, 3] < 128
     # A different colour produces a different image.
-    accented, _ = _paint("key", color="#6ea8fe")
-    plain, _ = _paint("key", color="#e6edf3")
-    assert not np.array_equal(accented, plain)
-
-
-def test_icon_painters_cache_images_per_name_and_colour():
-    icons = _load_icon_painters()
-    instance = icons()
-    instance._ui_palette = {"text": "#e6edf3", "accent": "#6ea8fe"}
-    first = icons._header_icon(instance, "sun")
-    assert icons._header_icon(instance, "sun") is first
-    assert icons._header_icon(instance, "sun", color="#6ea8fe") is not first
-
+    assert not np.array_equal(_paint("key", color="#6ea8fe"), _paint("key", color="#e6edf3"))

@@ -30,7 +30,8 @@ from ..config import (
 from ..utils.helpers import is_miicam_source
 from ..utils.hardware_advisor import run_hardware_diagnostic
 from ..data.project_store import ProjectStore
-from .theme import get_palette
+from .theme import get_palette, palette
+from .brand_logo import AnimatedLogo
 
 APP_SETTINGS_FILE = "config.json"
 
@@ -246,7 +247,8 @@ class SettingsWindow:
             self._diagnostic_poll_id = None
         self.win.destroy()
 
-    def _build(self):
+    def _apply_styles(self):
+        """Configure the window's ttk styles for the current theme; returns the palette."""
         style = ttk.Style(self.win)
         try:
             style.theme_use("clam")
@@ -269,8 +271,7 @@ class SettingsWindow:
         style.configure('App.TFrame', background=bg)
         style.configure('Header.TFrame', background=panel, relief='solid', borderwidth=1,
                         bordercolor=border, lightcolor=border, darkcolor=border)
-        style.configure('BrandMark.TLabel', background=accent, foreground=colors['accent_on'],
-                        font=('Segoe UI', 14, 'bold'), padding=(9, 5))
+        style.configure('HeaderInner.TFrame', background=panel)
         style.configure('HeaderTitle.TLabel', background=panel, foreground=fg,
                         font=('Segoe UI', 15, 'bold'))
         style.configure('HeaderSub.TLabel', background=panel, foreground=muted,
@@ -307,6 +308,19 @@ class SettingsWindow:
         style.configure('Primary.TButton', background=accent, foreground=colors['accent_on'],
                         padding=(13, 9), borderwidth=0, font=('Segoe UI', 9, 'bold'))
         style.map('Primary.TButton', background=[('pressed', colors['accent_hover']), ('active', colors['accent_hover'])])
+        # Accent action that stays readable while disabled: a neutral outlined
+        # button until a diagnostic result exists, then a filled accent one.
+        style.configure('Recommend.TButton', background=accent, foreground=colors['accent_on'],
+                        padding=(10, 7), borderwidth=1, bordercolor=accent,
+                        lightcolor=accent, darkcolor=accent, font=('Segoe UI', 9, 'bold'))
+        idle_border = palette(light)['border_strong']
+        style.map('Recommend.TButton',
+                  background=[('disabled', panel), ('pressed', colors['accent_hover']),
+                              ('active', colors['accent_hover'])],
+                  foreground=[('disabled', muted)],
+                  bordercolor=[('disabled', idle_border), ('active', colors['accent_hover'])],
+                  lightcolor=[('disabled', panel), ('active', colors['accent_hover'])],
+                  darkcolor=[('disabled', panel), ('active', colors['accent_hover'])])
         style.configure('Quiet.TButton', background=panel, foreground=fg, padding=(10, 7),
                         borderwidth=1, bordercolor=border, font=('Segoe UI', 9, 'bold'))
         style.map('Quiet.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
@@ -332,14 +346,38 @@ class SettingsWindow:
         style.configure('Vertical.TScrollbar', background=bg, troughcolor=bg,
                         bordercolor=bg, arrowcolor=muted)
 
+        return colors
+
+    def retheme(self):
+        """Repaint an open window after the app theme was switched."""
+        colors = self._apply_styles()
+        light = bool(self.config.get("light_theme", False))
+        self.brand_logo.set_theme(colors['surface'], light, colors['text'])
+        for listbox in (self.custom_var_list, self.custom_graph_list):
+            listbox.configure(bg=colors['surface'], fg=colors['text'],
+                              selectbackground=colors['accent_soft'], selectforeground=colors['accent'],
+                              highlightbackground=colors['border'])
+        self.notif_canvas.configure(bg=colors['background'])
+
+    def _build(self):
+        colors = self._apply_styles()
+        light = bool(self.config.get("light_theme", False))
+        bg = colors['background']
+        panel = colors['surface']
+        fg = colors['text']
+        border = colors['border']
+        accent = colors['accent']
+
         outer = ttk.Frame(self.win, padding=16, style='App.TFrame')
         outer.pack(fill='both', expand=True)
 
         header_frame = ttk.Frame(outer, style='Header.TFrame', padding=(16, 12))
         header_frame.pack(fill='x', pady=(0, 12))
-        ttk.Label(header_frame, text='E', style='BrandMark.TLabel', anchor='center').pack(side='left')
-        header_copy = ttk.Frame(header_frame, style='Header.TFrame')
-        header_copy.pack(side='left', padx=(11, 0))
+        self.brand_logo = AnimatedLogo(header_frame, panel, light, fg, word_size=30, sub_size=10)
+        self.brand_logo.pack(side='left')
+        ttk.Separator(header_frame, orient='vertical').pack(side='left', fill='y', padx=16, pady=2)
+        header_copy = ttk.Frame(header_frame, style='HeaderInner.TFrame')
+        header_copy.pack(side='left')
         ttk.Label(header_copy, text='Настройки анализа', style='HeaderTitle.TLabel').pack(anchor='w')
         ttk.Label(header_copy, text='Видео · графики · ROI · автометки · производительность',
                   style='HeaderSub.TLabel').pack(anchor='w', pady=(2, 0))
@@ -537,6 +575,7 @@ class SettingsWindow:
         # 4. TAB: АВТОМЕТКИ
         # =========================================================================
         notif_canvas = tk.Canvas(tab_notif, highlightthickness=0, bg=bg)
+        self.notif_canvas = notif_canvas
         notif_scrollbar = ttk.Scrollbar(tab_notif, orient="vertical", command=notif_canvas.yview)
         notif_canvas.configure(yscrollcommand=notif_scrollbar.set)
         notif_scrollbar.pack(side="right", fill="y")
@@ -734,7 +773,7 @@ class SettingsWindow:
         self.diagnostic_button.pack(side="left")
         self.apply_recommendation_button = ttk.Button(
             diagnostic_buttons, text="Подставить рекомендацию", command=self._apply_hardware_recommendation,
-            state="disabled", style="Primary.TButton"
+            state="disabled", style="Recommend.TButton"
         )
         self.apply_recommendation_button.pack(side="left", padx=(8, 0))
         self.diagnostic_status_var = tk.StringVar(value="Проверка запускается только по вашему запросу.")

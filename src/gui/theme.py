@@ -101,8 +101,13 @@ def hex_to_bgr(color):
     return (b, g, r)
 
 
-def set_native_titlebar(window, dark=True):
-    """Тёмный/светлый системный заголовок окна (Windows 10 1809+/11)."""
+def set_native_titlebar(window, dark=True, caption=None, text=None, border=None):
+    """Системный заголовок окна в цветах приложения.
+
+    Тёмный/светлый режим работает с Windows 10 1809+; цвета фона полосы,
+    текста и рамки (caption / text / border, '#RRGGBB') — с Windows 11,
+    на более старых системах они молча игнорируются.
+    """
     if not sys.platform.startswith("win"):
         return
     try:
@@ -112,14 +117,73 @@ def set_native_titlebar(window, dark=True):
         else:
             window.update_idletasks()
             hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        dwm = ctypes.windll.dwmapi
         value = ctypes.c_int(1 if dark else 0)
         for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (новое / старое значение)
-            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
-            ) == 0:
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
                 break
+        # DWMWA_BORDER_COLOR / CAPTION_COLOR / TEXT_COLOR; COLORREF = 0x00BBGGRR.
+        for attr, color in ((34, border), (35, caption), (36, text)):
+            if color:
+                r, g, b = hex_to_rgb(color)
+                ref = ctypes.c_uint(r | (g << 8) | (b << 16))
+                dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(ref), ctypes.sizeof(ref))
     except Exception:
         pass
+
+
+def style_titlebar(window, light=False):
+    """Заголовок окна сливается с шапкой приложения (фон = surface)."""
+    p = palette(light)
+    set_native_titlebar(window, dark=not light, caption=p["surface"], text=p["text"],
+                        border=p["border_strong"])
+
+
+_POPDOWN_LIGHT = {
+    # Native Windows look of the dropdown list, kept as is for the light theme.
+    "background": "SystemWindow", "foreground": "SystemWindowText",
+    "selectBackground": "SystemHighlight", "selectForeground": "SystemHighlightText",
+}
+_popdown_frame_default = {}
+
+
+def style_combobox_popdowns(root, light=False):
+    """Dropdown lists of ttk.Combobox in the app colours (dark theme only).
+
+    The list is a plain Tk listbox in its own popdown window, so ttk styles do
+    not reach it: new popdowns pick the colours up from the option database,
+    already created ones are reconfigured directly.
+    """
+    p = palette(light)
+    if light:
+        colors = dict(_POPDOWN_LIGHT)
+    else:
+        colors = {"background": p["surface_2"], "foreground": p["text"],
+                  "selectBackground": p["accent"], "selectForeground": p["on_accent"]}
+    for option, value in colors.items():
+        root.option_add(f"*TCombobox*Listbox.{option}", value)
+
+    style = ttk.Style(root)
+    if not _popdown_frame_default:
+        _popdown_frame_default["bordercolor"] = style.lookup("ComboboxPopdownFrame", "bordercolor")
+    style.configure("ComboboxPopdownFrame",
+                    bordercolor=_popdown_frame_default["bordercolor"] if light else p["border_strong"])
+
+    def _walk(widget):
+        for child in widget.winfo_children():
+            if isinstance(child, ttk.Combobox):
+                try:
+                    popdown = child.tk.call("ttk::combobox::PopdownWindow", child)
+                    child.tk.call(f"{popdown}.f.l", "configure",
+                                  "-background", colors["background"],
+                                  "-foreground", colors["foreground"],
+                                  "-selectbackground", colors["selectBackground"],
+                                  "-selectforeground", colors["selectForeground"])
+                except tk.TclError:
+                    pass
+            _walk(child)
+
+    _walk(root)
 
 
 def _resolve_fonts(widget):
@@ -831,6 +895,75 @@ class GradientButton(tk.Canvas):
         self.create_image(0, 0, image=self._photo, anchor="nw")
         dy = 1 if self._state == "pressed" else 0
         self.create_text(w / 2, h / 2 + dy, text=self._text, fill=self._fg, font=self._font)
+
+
+class StartButton(GradientButton):
+    """Главная кнопка «Начать анализ»: градиентная таблетка с мягким свечением
+    и иконкой Play в полупрозрачном круге."""
+
+    GLOW = 7  # поле под свечение вокруг таблетки, px
+
+    def __init__(self, parent, text, command=None, colors=("#7C6CFF", "#FF6FAE"),
+                 height=58, bg="#000000", font=None, fg="#FFFFFF"):
+        super().__init__(parent, text, command=command, colors=colors, height=height,
+                         bg=bg, font=font or (FONT_SEMIBOLD, 11), fg=fg)
+
+    def _render(self, w, h):
+        import numpy as np
+        from PIL import Image, ImageDraw, ImageFilter
+        k = 3
+        g = self.GLOW
+        factor = {"normal": 1.0, "hover": 1.1, "pressed": 0.9}[self._state]
+        glow_alpha = {"normal": 0.38, "hover": 0.6, "pressed": 0.22}[self._state]
+        pw, ph = w - 2 * g, h - 2 * g
+        dy = 1 if self._state == "pressed" else 0
+
+        # Свечение: размытая таблетка того же градиента, чуть сдвинутая вниз.
+        glow = Image.new("RGBA", (w * k, h * k), (0, 0, 0, 0))
+        pill = _gradient_image(pw, ph, self._colors[0], self._colors[1], radius=ph // 2, k=k)
+        shadow = pill.resize((pw * k, ph * k))
+        alpha = shadow.getchannel("A").point(lambda a: int(a * glow_alpha))
+        shadow.putalpha(alpha)
+        glow.paste(shadow, (g * k, (g + 3) * k), shadow)
+        glow = glow.filter(ImageFilter.GaussianBlur(5 * k)).resize((w, h), Image.LANCZOS)
+
+        bg = Image.new("RGBA", (w, h), hex_to_rgb(self.cget("bg")) + (255,))
+        bg.alpha_composite(glow)
+        face = _gradient_image(pw, ph, self._colors[0], self._colors[1], radius=ph // 2, factor=factor)
+        bg.alpha_composite(face, (g, g + dy))
+
+        # Иконка: полупрозрачный белый круг с треугольником Play.
+        d = 24
+        ic = Image.new("RGBA", (d * k, d * k), (0, 0, 0, 0))
+        di = ImageDraw.Draw(ic)
+        di.ellipse((0, 0, d * k - 1, d * k - 1), fill=(255, 255, 255, 56))
+        c = d * k / 2
+        s = d * k * 0.2
+        di.polygon([(c - s * 0.75, c - s), (c - s * 0.75, c + s), (c + s * 1.05, c)], fill=(255, 255, 255, 255))
+        ic = ic.resize((d, d), Image.LANCZOS)
+        return bg, ic
+
+    def _redraw(self):
+        from PIL import ImageTk
+        from tkinter import font as tkfont
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 4 * self.GLOW or h < 2 * self.GLOW + 4:
+            return
+        key = (w, h, self._state, self._colors, self.cget("bg"))
+        if key not in self._cache:
+            bg, ic = self._render(w, h)
+            self._cache = {kk: v for kk, v in self._cache.items() if kk[:2] == (w, h)}
+            self._cache[key] = (ImageTk.PhotoImage(bg, master=self), ImageTk.PhotoImage(ic, master=self))
+        self._photo, self._icon = self._cache[key]
+        self.delete("all")
+        self.create_image(0, 0, image=self._photo, anchor="nw")
+        dy = 1 if self._state == "pressed" else 0
+        text_w = tkfont.Font(root=self, font=self._font).measure(self._text)
+        gap, icon_w = 10, self._icon.width()
+        x0 = (w - (icon_w + gap + text_w)) / 2
+        self.create_image(x0, h / 2 + dy, image=self._icon, anchor="w")
+        self.create_text(x0 + icon_w + gap, h / 2 + dy, text=self._text, fill=self._fg,
+                         font=self._font, anchor="w")
 
 
 def gradient_orb(widget, p, size=38, letter="Э"):

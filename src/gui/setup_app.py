@@ -32,7 +32,12 @@ from ..utils.license_manager import (
 )
 from ..config import DEFAULT_PERFORMANCE_PROFILE, PERFORMANCE_PROFILES
 from ..utils.hardware_advisor import collect_system_profile
-from .theme import get_palette
+from .theme import (get_palette, palette as theme_palette, StartButton, style_titlebar,
+                    style_combobox_popdowns)
+from .brand_logo import AnimatedLogo, app_icon
+from .header_toolbar import HeaderToolbar
+from .source_buttons import SourceButton
+from .roi_slider import RoiSlider
 from .license_dialog import LicenseDialog
 from .project_window import ProjectManagerDialog
 from ..data.project_store import ProjectStore
@@ -126,8 +131,21 @@ class PreviewWorker:
 
 class SetupApp:
     def __init__(self):
+        # Own taskbar identity, so Windows shows the app icon instead of python's.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Elutec.SARA.RGB')
+        except Exception:
+            pass
         self.root = tk.Tk()
         self.root.title("Элютек · SARA RGB анализ")
+        try:
+            self._app_icons = [ImageTk.PhotoImage(app_icon(s), master=self.root) for s in (256, 64, 32, 16)]
+            self.root.iconphoto(True, *self._app_icons)
+        except Exception:
+            pass
+        # Every dialog gets the same native title bar colours as the main window.
+        self.root.bind_class('Toplevel', '<Map>', self._style_toplevel_titlebar, add='+')
         self.root.geometry("1480x900")
         self.root.minsize(1180, 720)
         # The capture card is the primary instrument, so start with the largest
@@ -316,6 +334,11 @@ class SetupApp:
         self._ui_palette = colors
 
         self.root.configure(bg=bg)
+        style_titlebar(self.root, light)
+        style_combobox_popdowns(self.root, light)
+        for child in self.root.winfo_children():
+            if isinstance(child, tk.Toplevel):
+                self._style_toplevel_titlebar(widget=child)
         style.configure('.', font=('Segoe UI', 10), background=bg, foreground=fg)
         style.configure('TFrame', background=bg)
         for name, color in (
@@ -368,20 +391,11 @@ class SetupApp:
         style.map('Primary.TButton',
                   background=[('disabled', border), ('pressed', colors['accent_hover']), ('active', colors['accent_hover'])],
                   foreground=[('disabled', muted)])
-        style.configure('Secondary.TButton', background=colors['accent_soft'], foreground=accent,
-                        borderwidth=0, padding=(10, 7), font=('Segoe UI', 9, 'bold'))
-        style.map('Secondary.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
-                  foreground=[('disabled', muted)])
         style.configure('Quiet.TButton', background=surface, foreground=fg, borderwidth=1,
                         bordercolor=border, padding=(9, 6), font=('Segoe UI', 9, 'bold'))
         style.map('Quiet.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
                   bordercolor=[('active', accent)])
-        # Compact icon-only button (theme / licence) and the project-name
-        # switcher that reads like a heading but opens the project picker.
-        style.configure('Icon.TButton', background=surface, foreground=fg, borderwidth=1,
-                        bordercolor=border, padding=(7, 6))
-        style.map('Icon.TButton', background=[('pressed', colors['surface_hover']), ('active', colors['surface_hover'])],
-                  bordercolor=[('active', accent)])
+        # The project-name switcher reads like a heading but opens the picker.
         style.configure('ProjectLink.TButton', background=surface, foreground=fg, borderwidth=0,
                         padding=(0, 1), anchor='w', font=('Segoe UI', 15, 'bold'))
         style.map('ProjectLink.TButton', background=[('pressed', surface), ('active', surface)],
@@ -481,12 +495,27 @@ class SetupApp:
                 )
             except Exception:
                 pass
-        if hasattr(self, 'theme_btn'):
-            # Icon follows the *target* theme: a sun is offered while the dark
-            # palette is active, a moon while the light one is.
-            self._refresh_header_icons()
-        if hasattr(self, 'brand_canvas'):
-            self._draw_brand_mark()
+        if hasattr(self, 'header_actions'):
+            self.header_actions.set_palette(colors)
+            HeaderToolbar.set_icon(self.theme_btn, self._theme_icon_name())
+        if hasattr(self, 'brand_logo'):
+            self.brand_logo.set_theme(surface, light, fg)
+        for slider in getattr(self, 'roi_sliders', []):
+            slider.set_palette(colors)
+        if hasattr(self, 'source_rgb_btn'):
+            self.source_rgb_btn.set_palette(colors)
+            self.source_usb_btn.set_palette(colors)
+        if hasattr(self, 'start_btn'):
+            self.start_btn.configure_theme(surface, self._start_button_colors())
+        # ttk styles are shared, so an open settings window must repaint its own
+        # styles and widgets too, otherwise it ends up half in the old theme.
+        settings = getattr(self, '_settings_window', None)
+        if settings is not None:
+            try:
+                if settings.win.winfo_exists():
+                    settings.retheme()
+            except Exception:
+                pass
         self._update_license_ui()
 
     def _set_preview_connection_state(self, connected):
@@ -522,9 +551,7 @@ class SetupApp:
                 text = 'Лицензия не активирована · нажмите, чтобы активировать'
                 tone = colors.get('warning', colors['accent'])
             self._license_status_text = text
-            icon = self._header_icon('key', color=tone)
-            self.lic_btn.configure(image=icon)
-            self.lic_btn.image = icon
+            HeaderToolbar.set_badge(self.lic_btn, tone)
         except Exception:
             pass
 
@@ -565,14 +592,11 @@ class SetupApp:
         # Slim product header: identity, connection context, and global actions.
         header = ttk.Frame(app_shell, style='Topbar.TFrame', padding=(18, 10, 18, 10))
         header.pack(fill='x')
-        self.brand_canvas = tk.Canvas(header, width=38, height=38, bd=0, highlightthickness=0,
-                                      bg=colors['surface'])
-        self.brand_canvas.pack(side='left')
-        self._draw_brand_mark()
-        brand_copy = ttk.Frame(header, style='Topbar.TFrame')
-        brand_copy.pack(side='left', padx=(10, 18))
-        ttk.Label(brand_copy, text='ELUTEC  /  LAB SYSTEMS', style='Eyebrow.TLabel').pack(anchor='w')
-        ttk.Label(brand_copy, text='SARA RGB', style='Title.TLabel').pack(anchor='w', pady=(1, 0))
+        # Animated ЭЛЮТЕК logo (RGB-split wordmark + «RGB SARA-АНАЛИЗ»).
+        self.brand_logo = AnimatedLogo(
+            header, colors['surface'], bool(self.config.get('light_theme', False)), colors['text'],
+            word_size=36, sub_size=11,
+        ).pack(side='left', padx=(0, 18))
         ttk.Separator(header, orient='vertical').pack(side='left', fill='y', padx=(0, 16), pady=3)
         # The former "working console" caption is replaced by the project
         # context: the open project name (click = switch project) or the
@@ -591,17 +615,15 @@ class SetupApp:
         self.project_name_btn.pack(anchor='w')
         self.project_pick_btn.pack(side='left', pady=(6, 0))
 
-        # Global actions: theme and licence are icon-only so the top-right
-        # corner stays quiet; settings keeps its label.
-        self.lic_btn = ttk.Button(header, text='', command=self.open_license_dialog, style='Icon.TButton')
-        self.lic_btn.pack(side='right', padx=(7, 0))
-        settings_btn = ttk.Button(header, text='Настройки', command=self.open_settings, style='Secondary.TButton')
-        settings_btn.pack(side='right', padx=(7, 0))
-        self.theme_btn = ttk.Button(header, text='', command=self.toggle_theme, style='Icon.TButton')
-        self.theme_btn.pack(side='right')
-        self._refresh_header_icons()
-        self._attach_tooltip(self.theme_btn, self._theme_tooltip)
-        self._attach_tooltip(self.lic_btn, self._license_tooltip)
+        # Global actions in one rounded group: theme and licence are icon-only
+        # (licence status is a coloured dot), settings keeps its label.
+        self.header_actions = HeaderToolbar(header, colors).pack(side='right')
+        self.theme_btn = self.header_actions.add(self._theme_icon_name(), self.toggle_theme)
+        self.settings_btn = self.header_actions.add('gear', self.open_settings, text='Настройки')
+        self.lic_btn = self.header_actions.add('key', self.open_license_dialog)
+        self._attach_tooltip(self.theme_btn.label, self._theme_tooltip)
+        self._attach_tooltip(self.lic_btn.label, self._license_tooltip)
+        self._attach_tooltip(self.project_name_btn, self._project_tooltip)
         self._update_license_ui()
 
         body = ttk.Frame(app_shell, style='App.TFrame', padding=(16, 12, 16, 12))
@@ -610,12 +632,11 @@ class SetupApp:
         page_head.pack(fill='x', pady=(0, 10))
         page_title = ttk.Frame(page_head, style='App.TFrame')
         page_title.pack(side='left', fill='x', expand=True)
-        ttk.Label(page_title, text='SESSION / 01', style='PageEyebrow.TLabel').pack(anchor='w')
-        ttk.Label(page_title, text='Мониторинг', style='SectionTitle.TLabel').pack(anchor='w', pady=(1, 0))
+        ttk.Label(page_title, text='Мониторинг', style='SectionTitle.TLabel').pack(anchor='w')
         self.camera_status_badge = ttk.Label(
             page_head, textvariable=self.camera_status_var, style='WaitingBadge.TLabel'
         )
-        self.camera_status_badge.pack(side='right', padx=(8, 0), pady=(5, 0))
+        self.camera_status_badge.pack(side='right', padx=(8, 0))
 
         main_body = ttk.Frame(body, style='App.TFrame')
         main_body.pack(fill='both', expand=True)
@@ -634,13 +655,25 @@ class SetupApp:
         left = ttk.Frame(self.left_canvas, style='Control.TFrame')
         left_window_id = self.left_canvas.create_window((0, 0), window=left, anchor='nw')
 
+        def _left_content_fits():
+            return left.winfo_reqheight() <= self.left_canvas.winfo_height()
+
         def _update_left_scrollregion(event=None):
-            self.left_canvas.configure(scrollregion=self.left_canvas.bbox('all'))
+            # The region is never shorter than the visible canvas, so the
+            # content stays pinned to the top when everything fits.
+            width = self.left_canvas.winfo_width()
+            height = max(left.winfo_reqheight(), self.left_canvas.winfo_height())
+            self.left_canvas.configure(scrollregion=(0, 0, width, height))
+            if _left_content_fits():
+                self.left_canvas.yview_moveto(0)
 
         def _fit_left_width(event):
             self.left_canvas.itemconfigure(left_window_id, width=event.width)
+            _update_left_scrollregion()
 
         def _on_left_mousewheel(event):
+            if _left_content_fits():
+                return
             if getattr(event, 'num', None) == 4:
                 self.left_canvas.yview_scroll(-1, 'units')
             elif getattr(event, 'num', None) == 5:
@@ -679,14 +712,13 @@ class SetupApp:
 
         # 01 — device discovery, source selection, and file input.
         frame_scan = make_section(left, '01', 'ВВОД', 'Источник сигнала')
-        scan_actions = ttk.Frame(frame_scan, style='Card.TFrame')
-        scan_actions.pack(fill='x', pady=(0, 7))
-        scan_actions.columnconfigure(0, weight=1)
-        scan_actions.columnconfigure(1, weight=1)
-        ttk.Button(scan_actions, text='RGB-детектор', command=self.scan_rgb_detector,
-                   style='Small.TButton').grid(row=0, column=0, sticky='ew', padx=(0, 4))
-        ttk.Button(scan_actions, text='USB-камера', command=self.scan_usb_cameras,
-                   style='Small.TButton').grid(row=0, column=1, sticky='ew', padx=(4, 0))
+        # Source kinds stacked as full-width cards; the connected one is marked.
+        self.source_rgb_btn = SourceButton(
+            frame_scan, colors, 'rgb', 'RGB-детектор', 'MiiCam · USB-детектор', self.scan_rgb_detector,
+        ).pack(fill='x', pady=(0, 6))
+        self.source_usb_btn = SourceButton(
+            frame_scan, colors, 'usb', 'USB-камера', 'Веб-камера или карта захвата', self.scan_usb_cameras,
+        ).pack(fill='x', pady=(0, 8))
 
         devices_box_frame = ttk.Frame(frame_scan, style='CardInset.TFrame', padding=3)
         devices_box_frame.pack(fill='both', expand=True, pady=(0, 7))
@@ -757,6 +789,25 @@ class SetupApp:
         create_spin_field(roi_grid, 0, 1, 'Y · PX', self.var_y, 0, 1080)
         create_spin_field(roi_grid, 1, 0, 'Ширина', self.var_w, 20, 1920, 10)
         create_spin_field(roi_grid, 1, 1, 'Высота', self.var_h, 20, 1080, 10)
+
+        # Sliders under the fields, two-way linked with the same variables.
+        sliders = ttk.Frame(frame_roi, style='Card.TFrame')
+        sliders.pack(fill='x', pady=(8, 0))
+        sliders.columnconfigure(1, weight=1)
+        frame_w = lambda: self.preview_width if self._roi_slider_frame else 1920  # noqa: E731
+        frame_h = lambda: self.preview_height if self._roi_slider_frame else 1080  # noqa: E731
+        self._roi_slider_frame = None
+        self.roi_sliders = []
+        for row, (label, var, range_fn) in enumerate((
+            ('X', self.var_x, lambda: (0, frame_w())),
+            ('Y', self.var_y, lambda: (0, frame_h())),
+            ('Ширина', self.var_w, lambda: (self.MIN_ROI_SIZE, frame_w())),
+            ('Высота', self.var_h, lambda: (self.MIN_ROI_SIZE, frame_h())),
+        )):
+            ttk.Label(sliders, text=label, style='CardMuted.TLabel').grid(row=row, column=0, sticky='w', padx=(0, 8))
+            self.roi_sliders.append(
+                RoiSlider(sliders, colors, var, range_fn).grid(row=row, column=1, sticky='ew', pady=1)
+            )
         self.coord_label = ttk.Label(frame_roi, text='X 0 · Y 0 · W 0 · H 0', style='CardMuted.TLabel')
         self.coord_label.pack(anchor='w', pady=(6, 0))
         roi_quick = ttk.Frame(frame_roi, style='Card.TFrame')
@@ -766,22 +817,15 @@ class SetupApp:
                        command=lambda value=factor: self.change_roi_size(value)).pack(side='left', fill='x', expand=True, padx=(0, 4))
         ttk.Button(roi_quick, text='Сброс', style='Small.TButton', command=self.reset_roi).pack(side='left', fill='x', expand=True)
         self.update_coord_label()
-        ttk.Separator(left, orient='horizontal').pack(fill='x', padx=12)
+        # Output destination is the project chosen in the header ("ТЕКУЩИЙ
+        # ПРОЕКТ"); its sessions folder is shown as a hint on the project name.
 
-        # 03 — output destination; no duplicate explanation text.
-        frame_save = make_section(left, '03', 'РЕЗУЛЬТАТЫ', 'Папка проекта')
-        self.session_path_var = tk.StringVar(master=self.root, value='Проект не выбран')
-        self.entry_save_folder = ttk.Entry(frame_save, textvariable=self.session_path_var, state='readonly')
-        self.entry_save_folder.pack(fill='x', pady=(0, 6))
-        ttk.Button(frame_save, text='Выбрать / создать проект…', command=self.open_project_manager,
-                   style='Quiet.TButton').pack(fill='x')
-        ttk.Label(frame_save, text='Для каждого анализа создаётся отдельная сессия.',
-                  style='CardMuted.TLabel', wraplength=255).pack(anchor='w', pady=(7, 0))
-
-        action_bar = ttk.Frame(left_outer, style='Control.TFrame', padding=(12, 10, 12, 11))
+        # The button draws its own glow, so the bar padding is tighter.
+        action_bar = ttk.Frame(left_outer, style='Control.TFrame', padding=(5, 4, 5, 5))
         action_bar.pack(fill='x')
-        ttk.Button(action_bar, text='▶   НАЧАТЬ АНАЛИЗ', command=self.start_analysis,
-                   style='Primary.TButton').pack(fill='x')
+        self.start_btn = StartButton(action_bar, 'Начать анализ', command=self.start_analysis,
+                                     colors=self._start_button_colors(), bg=colors['surface'])
+        self.start_btn.pack(fill='x')
 
         # Central monitoring surface: live image first, history immediately below.
         right = ttk.Frame(main_body, style='App.TFrame')
@@ -797,8 +841,7 @@ class SetupApp:
         preview_header.pack(fill='x', pady=(0, 8))
         preview_copy = ttk.Frame(preview_header, style='Card.TFrame')
         preview_copy.pack(side='left', fill='x', expand=True)
-        ttk.Label(preview_copy, text='A  /  CAPTURE', style='Eyebrow.TLabel').pack(anchor='w')
-        ttk.Label(preview_copy, text='Видеопоток', style='CardTitle.TLabel').pack(anchor='w', pady=(2, 0))
+        ttk.Label(preview_copy, text='Видеопоток', style='CardTitle.TLabel').pack(anchor='w')
         self.preview_spec_label = ttk.Label(preview_header, text='RGB  ·  LIVE INPUT', style='CardMuted.TLabel')
         self.preview_spec_label.pack(side='right', padx=(6, 0))
         self.preview_label = ttk.Label(frame_prev, style='Preview.TLabel', anchor='center')
@@ -812,8 +855,7 @@ class SetupApp:
         frame_chart.pack(fill='x', pady=(10, 0))
         chart_header = ttk.Frame(frame_chart, style='Card.TFrame')
         chart_header.pack(fill='x', pady=(0, 6))
-        ttk.Label(chart_header, text='B  /  LIVE DATA', style='Eyebrow.TLabel').pack(side='left')
-        ttk.Label(chart_header, text='История сигнала', style='CardTitle.TLabel').pack(side='left', padx=(8, 0))
+        ttk.Label(chart_header, text='История сигнала', style='CardTitle.TLabel').pack(side='left')
         legend = ttk.Frame(chart_header, style='Card.TFrame')
         legend.pack(side='right')
         for code, label_style in (('● R', 'R.TLabel'), ('● G', 'G.TLabel'), ('● B', 'B.TLabel')):
@@ -844,97 +886,48 @@ class SetupApp:
             pass
         self.root.after(200, self.auto_connect_startup_camera)
 
-    def _header_icon(self, name, size=18, color=None):
-        """Draw a small crisp header icon with Pillow (supersampled, cached).
+    def _redraw_roi_sliders(self):
+        for slider in getattr(self, 'roi_sliders', []):
+            slider.redraw()
 
-        Icons are painted from the active palette, so sun/moon/key follow the
-        selected theme without shipping any image assets.
-        """
-        colors = getattr(self, '_ui_palette', get_palette(False))
-        color = color or colors['text']
-        cache = getattr(self, '_header_icon_cache', None)
-        if cache is None:
-            cache = {}
-            self._header_icon_cache = cache
-        cache_key = (name, size, color)
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
+    def _mark_active_source(self, source, is_file=False):
+        """Highlight the source card matching the connected input (none for files)."""
+        connected = source is not None and str(source).strip() != '' and not is_file
+        miicam = connected and is_miicam_source(source)
+        usb = connected and not miicam and not is_network_source(source)
+        if hasattr(self, 'source_rgb_btn'):
+            self.source_rgb_btn.set_active(miicam)
+            self.source_usb_btn.set_active(usb)
 
-        scale = 4
-        px = int(size) * scale
-        image = Image.new('RGBA', (px, px), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        rgb = self._hex_to_rgb(color)
-        # Supersampling needs an explicit alpha, otherwise transparent pixels
-        # are painted opaque black.
-        rgb = (rgb[0], rgb[1], rgb[2], 255)
-        stroke = max(2, int(px * 0.085))
-
-        if name == 'sun':
-            center = px / 2.0
-            radius = px * 0.2
-            draw.ellipse((center - radius, center - radius, center + radius, center + radius), fill=rgb)
-            for step in range(8):
-                angle = math.radians(step * 45)
-                dx, dy = math.cos(angle), math.sin(angle)
-                draw.line((center + px * 0.31 * dx, center + px * 0.31 * dy,
-                           center + px * 0.44 * dx, center + px * 0.44 * dy),
-                          fill=rgb, width=stroke)
-        elif name == 'moon':
-            draw.ellipse((px * 0.08, px * 0.08, px * 0.92, px * 0.92), fill=rgb)
-            # Punch the crescent out of the disc: the cutting circle is offset
-            # far enough for the centre of the disc to stay painted.
-            offset = px * 0.55 * math.cos(math.radians(-45))
-            cut_radius = px * 0.42
-            cut_x = px * 0.5 + offset
-            cut_y = px * 0.5 - offset
-            draw.ellipse((cut_x - cut_radius, cut_y - cut_radius,
-                          cut_x + cut_radius, cut_y + cut_radius), fill=(0, 0, 0, 0))
-        elif name == 'key':
-            ring_x, ring_y, ring_r = px * 0.30, px * 0.70, px * 0.18
-            draw.ellipse((ring_x - ring_r, ring_y - ring_r, ring_x + ring_r, ring_y + ring_r),
-                         outline=rgb, width=stroke)
-            dx, dy = math.cos(math.radians(-45)), math.sin(math.radians(-45))
-            shaft_x, shaft_y = ring_x + ring_r * dx, ring_y + ring_r * dy
-            end_x, end_y = shaft_x + px * 0.44 * dx, shaft_y + px * 0.44 * dy
-            draw.line((shaft_x, shaft_y, end_x, end_y), fill=rgb, width=stroke)
-            tooth_x, tooth_y = -dy, dx
-            for fraction in (0.34, 0.60):
-                base_x = shaft_x + px * 0.44 * fraction * dx
-                base_y = shaft_y + px * 0.44 * fraction * dy
-                draw.line((base_x, base_y, base_x + px * 0.14 * tooth_x, base_y + px * 0.14 * tooth_y),
-                          fill=rgb, width=stroke)
-        else:
-            draw.ellipse((0, 0, px - 1, px - 1), outline=rgb, width=stroke)
-
-        image = image.resize((int(size), int(size)), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(image)
-        cache[cache_key] = photo
-        return photo
-
-    @staticmethod
-    def _hex_to_rgb(value):
-        text = str(value or '#ffffff').lstrip('#')
-        if len(text) == 3:
-            text = ''.join(channel * 2 for channel in text)
+    def _style_toplevel_titlebar(self, event=None, widget=None):
+        window = widget if widget is not None else getattr(event, 'widget', None)
+        if not isinstance(window, tk.Toplevel):
+            return
         try:
-            return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))
-        except ValueError:
-            return (255, 255, 255)
-
-    def _refresh_header_icons(self):
-        """Repaint the icon-only header buttons for the current palette."""
-        try:
-            icon = self._header_icon('moon' if bool(self.config.get('light_theme', False)) else 'sun')
-            self.theme_btn.configure(image=icon)
-            self.theme_btn.image = icon
+            if window.wm_overrideredirect():  # tooltips have no title bar
+                return
         except Exception:
-            pass
+            return
+        style_titlebar(window, bool(self.config.get('light_theme', False)))
+
+    def _start_button_colors(self):
+        brand = theme_palette(bool(self.config.get('light_theme', False)))
+        return (brand['grad_a'], brand['grad_b'])
+
+    def _theme_icon_name(self):
+        # Icon follows the *target* theme: a sun is offered while the dark
+        # palette is active, a moon while the light one is.
+        return 'moon' if bool(self.config.get('light_theme', False)) else 'sun'
 
     def _theme_tooltip(self):
         target = 'тёмную' if bool(self.config.get('light_theme', False)) else 'светлую'
         return f'Переключить на {target} тему'
+
+    def _project_tooltip(self):
+        target = getattr(self, '_project_target_text', '')
+        if not target:
+            return 'Сменить проект'
+        return f'Результаты сохраняются в:\n{target}\nНажмите, чтобы сменить проект'
 
     def _license_tooltip(self):
         return getattr(self, '_license_status_text', 'Лицензия')
@@ -980,22 +973,6 @@ class SetupApp:
             except Exception:
                 pass
             self._tooltip_window = None
-
-    def _draw_brand_mark(self):
-        canvas = getattr(self, 'brand_canvas', None)
-        if canvas is None:
-            return
-        colors = getattr(self, '_ui_palette', get_palette(False))
-        canvas.configure(bg=colors['surface'])
-        canvas.delete('all')
-        canvas.create_rectangle(2, 2, 36, 36, fill=colors['surface_alt'], outline=colors['border'], width=1)
-        accent = colors['accent']
-        canvas.create_line(9, 10, 28, 10, fill=accent, width=2)
-        canvas.create_line(9, 10, 9, 28, fill=accent, width=2)
-        canvas.create_line(9, 19, 22, 19, fill=accent, width=2)
-        canvas.create_line(9, 28, 28, 28, fill=accent, width=2)
-        canvas.create_line(12, 23, 16, 23, 18, 16, 21, 25, 24, 19, 27, 19,
-                          fill=colors['text'], width=1)
 
     def auto_connect_startup_camera(self):
         """Автоматически сканирует USB-камеры при запуске и подключает первую доступную рабочую камеру с видеопотоком."""
@@ -1143,8 +1120,7 @@ class SetupApp:
                     self.project_pick_btn.pack(side='left', pady=(6, 0))
             except Exception:
                 pass
-        if hasattr(self, "session_path_var"):
-            self.session_path_var.set(target)
+        self._project_target_text = target
 
     def open_project_manager(self):
         ProjectManagerDialog(
@@ -1169,7 +1145,18 @@ class SetupApp:
         self.open_project_manager()
 
     def open_settings(self):
-        SettingsWindow(
+        # Only one settings window: repeated clicks bring the open one forward.
+        existing = getattr(self, '_settings_window', None)
+        if existing is not None:
+            try:
+                if existing.win.winfo_exists():
+                    existing.win.deiconify()
+                    existing.win.lift()
+                    existing.win.focus_force()
+                    return
+            except Exception:
+                pass
+        self._settings_window = SettingsWindow(
             self.root, self.config, on_apply=self.apply_settings,
             current_cap=self.cap, project_store=self.project_store if self.project_store else ProjectStore(),
             diagnostic_sample_provider=self._get_diagnostic_sample,
@@ -1546,6 +1533,8 @@ class SetupApp:
                 except Exception:
                     pass
                 self.cap = None
+            # Nothing is connected until the new source actually opens.
+            self._mark_active_source(None)
 
             time.sleep(0.05)
 
@@ -1639,6 +1628,7 @@ class SetupApp:
                         display_name = name
                         break
                 self.devices_label.config(text=f"Выбранное устройство: {display_name} ({w}x{h})")
+                self._mark_active_source(source_clean, is_file)
 
                 if verbose:
                     if is_file:
@@ -2147,6 +2137,10 @@ class SetupApp:
                 self.preview_width = width
                 self.preview_height = height
                 self.update_coord_label()
+                if (width, height) != getattr(self, '_roi_slider_frame', None):
+                    # Slider ranges follow the frame size.
+                    self._roi_slider_frame = (width, height)
+                    self._redraw_roi_sliders()
 
                 # INTER_AREA keeps a high-resolution sensor from aliasing when
                 # it is squeezed into the card; small frames may be enlarged.
